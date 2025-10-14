@@ -4,10 +4,12 @@
  * 1. Receives data from other ESP32 boards via ESP-NOW.
  * 2. Displays the received data on a local TFT screen using LVGL.
  * 3. Forwards the data to a Firebase Realtime Database.
+ * 4. NEW: Calculates the duration when a board's status is '1' and sends it
+ * to Firebase when the status changes back.
  *
  * All necessary configurations and credentials are included in this single file.
 *********/
-#define ENABLE_USER_AUTH 
+#define ENABLE_USER_AUTH
 #define ENABLE_DATABASE
 // --- Wi-Fi Credentials ---
 // Replace with your network SSID (name) and password
@@ -89,6 +91,13 @@ RealtimeDatabase Database;
 // --- LVGL GUI Objects ---
 static lv_obj_t * table1;
 static lv_obj_t * table2;
+
+// --- NEW: Variables for Duration Tracking ---
+int last_status_board1 = 0;
+int last_status_board2 = 0;
+unsigned long start_time_board1 = 0;
+unsigned long start_time_board2 = 0;
+
 
 // --- Callback Functions ---
 
@@ -327,7 +336,7 @@ void setup() {
     return;
   }
   esp_now_register_recv_cb(OnDataRecv);
-    // --- FIX: REGISTER PEERS WITH THE CORRECT WI-FI CHANNEL ---
+
   esp_now_peer_info_t peerInfo = {};
   peerInfo.channel = WiFi.channel(); // Use the channel we are connected on
   peerInfo.encrypt = false;          // No encryption
@@ -391,10 +400,54 @@ void loop() {
   if (xQueueReceive(esp_now_queue, &receivedData, 0) == pdTRUE) {
     Serial.printf("Processing data from Board ID: %d\n", receivedData.id);
     
+    // --- NEW: Duration Calculation Logic ---
+    if (receivedData.id == 1) {
+        // Event starts: status changes to 1
+        if (receivedData.status == 1 && last_status_board1 != 1) {
+            start_time_board1 = millis();
+            Serial.println("Board 1: Event started, timer initiated.");
+        } 
+        // Event ends: status changes from 1 to something else
+        else if (receivedData.status != 1 && last_status_board1 == 1) {
+            unsigned long duration_ms = millis() - start_time_board1;
+            unsigned long duration_s = duration_ms / 1000; // Convert to seconds
+            Serial.printf("Board 1: Event ended. Duration: %lu seconds.\n", duration_s);
+
+            // Send the duration to Firebase
+            if (app.ready()) {
+                String path = "/board1/duration_seconds";
+                Database.set<unsigned long>(aClient, path, duration_s, processData, "SendDuration1");
+            }
+        }
+        // Update the last known status for board 1
+        last_status_board1 = receivedData.status;
+
+    } else if (receivedData.id == 2) {
+        // Event starts: status changes to 1
+        if (receivedData.status == 1 && last_status_board2 != 1) {
+            start_time_board2 = millis();
+            Serial.println("Board 2: Event started, timer initiated.");
+        }
+        // Event ends: status changes from 1 to something else
+        else if (receivedData.status != 1 && last_status_board2 == 1) {
+            unsigned long duration_ms = millis() - start_time_board2;
+            unsigned long duration_s = duration_ms / 1000; // Convert to seconds
+            Serial.printf("Board 2: Event ended. Duration: %lu seconds.\n", duration_s);
+
+            // Send the duration to Firebase
+            if (app.ready()) {
+                String path = "/board2/duration_seconds";
+                Database.set<unsigned long>(aClient, path, duration_s, processData, "SendDuration2");
+            }
+        }
+        // Update the last known status for board 2
+        last_status_board2 = receivedData.status;
+    }
+
     // 1. Update the local display
     update_table_values(&receivedData);
 
-    // 2. Forward the data to Firebase
+    // 2. Forward the other data to Firebase
     sendDataToFirebase(&receivedData);
   }
 }
