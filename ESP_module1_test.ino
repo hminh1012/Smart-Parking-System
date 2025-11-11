@@ -29,11 +29,18 @@ typedef struct {
   int readingId;
 } struct_message;
 
+
+// Structure for sending LED control commands
+typedef struct led_message {
+  int id;
+  bool state; // true for ON, false for OFF
+} led_message;
+
 // Create one struct for sending data
 struct_message myData;
 
 // Create one struct for receiving data
-struct_message incomingData;
+led_message incomingData;
 
 // ESP-NOW peer info
 esp_now_peer_info_t peerInfo;
@@ -75,12 +82,9 @@ void OnDataRecv(const esp_now_recv_info *recv_info, const uint8_t *incomingDataB
     Serial.println(len);
     Serial.print("From Board ID: ");
     Serial.println(incomingData.id);
-    Serial.print("Status: ");
-    Serial.println(incomingData.status);
-    Serial.print("CarLicense: ");
-    Serial.println(incomingData.CarLicense);
-    Serial.print("Reading ID: ");
-    Serial.println(incomingData.readingId);
+    Serial.print("Led Status: ");
+    Serial.println(incomingData.state);
+
 
     // Print the sender's MAC address (FIXED: using recv_info->src_addr)
     char macStr[18];
