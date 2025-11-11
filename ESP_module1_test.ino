@@ -9,6 +9,18 @@
 #include <esp_now.h>
 #include <WiFi.h>
 
+
+// --- ADDED FROM WS2812.ino ---
+#include <Adafruit_NeoPixel.h>
+#ifdef __AVR__
+#include <avr/power.h> // Required for 16 MHz Adafruit Trinket
+#endif
+
+#define PIN_WS2812B 16  // The ESP32 pin connected to WS2812B
+#define NUM_PIXELS 8  // The number of LEDs on your strip
+// ------------------------------
+
+
 // ------------------------------------------------
 // !! IMPORTANT !!
 // UPDATE THESE MAC ADDRESSES TO MATCH YOUR BOARDS
@@ -19,6 +31,13 @@ uint8_t macAddress2[] = {0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x02};
 
 uint8_t peerAddress[6]; // MAC Address of the *other* board
 int boardId;             // This board's ID (1 or 2)
+
+
+// --- ADDED FROM WS2812.ino ---
+Adafruit_NeoPixel WS2812B(NUM_PIXELS, PIN_WS2812B, NEO_GRB + NEO_KHZ800);
+// ------------------------------
+
+
 
 // This structure will be used for *both* sending and receiving
 // It's from your first "sender" code.
@@ -49,6 +68,16 @@ esp_now_peer_info_t peerInfo;
 unsigned long previousMillis = 0;
 const long interval = 5000; // Send data every 1 second
 unsigned int readingId = 0;
+
+// --- NEW HELPER FUNCTIONS ---
+// Sets all pixels to a specific color
+void setStripColor(uint32_t color) {
+  for (int pixel = 0; pixel < NUM_PIXELS; pixel++) { // For each pixel 
+    WS2812B.setPixelColor(pixel, color); // Set color 
+  }
+  WS2812B.show(); // Update the strip [cite: 10]
+}
+// ------------------------------
 
 
 // ------------------------------------------------
@@ -84,6 +113,17 @@ void OnDataRecv(const esp_now_recv_info *recv_info, const uint8_t *incomingDataB
     Serial.println(incomingData.id);
     Serial.print("Led Status: ");
     Serial.println(incomingData.state);
+    Serial.println("-----------------------------------");
+    Serial.println();
+  // --- NEW LOGIC TO CONTROL WS2812B ---
+    if (incomingData.state == true) { // state is 1
+      Serial.println("Setting strip to RED");
+      setStripColor(WS2812B.Color(255, 0, 0)); // Set all to RED 
+    } else { // state is 0 or false
+      Serial.println("Setting strip to GREEN");
+      setStripColor(WS2812B.Color(0, 255, 0)); // Set all to GREEN [cite: 3]
+    }
+    // --- END NEW LOGIC ---
 
 
     // Print the sender's MAC address (FIXED: using recv_info->src_addr)
@@ -107,6 +147,12 @@ void OnDataRecv(const esp_now_recv_info *recv_info, const uint8_t *incomingDataB
 void setup() {
   Serial.begin(115200);
   delay(1000); // Give serial time to start
+// --- ADDED FROM WS2812.ino ---
+  WS2812B.begin();  // INITIALIZE WS2812B strip object 
+  WS2812B.clear();
+  setStripColor(WS2812B.Color(0, 255, 0)); // Set default color to GREEN
+  Serial.println("LED Strip set to GREEN");
+  // ------------------------------
 
   // Set device as a Wi-Fi Station
   WiFi.mode(WIFI_STA);
