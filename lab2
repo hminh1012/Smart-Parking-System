@@ -64,7 +64,7 @@ Adafruit_NeoPixel WS2812B(NUM_PIXELS, PIN_WS2812B, NEO_GRB + NEO_KHZ800);
 
 // Timer variables for loop
 unsigned long lastSendTime = 0;
-const unsigned long sendInterval = 10000; // 10 seconds in milliseconds
+const unsigned long sendInterval = 3000; // 3 seconds in milliseconds
 
 // --- Function Declarations ---
 void processData(AsyncResult &aResult);
@@ -90,6 +90,10 @@ void setup(){
   WS2812B.setBrightness(50); // Set brightness (0-255)
   setStripColor(WS2812B.Color(0, 0, 255)); // Set to Blue during init
   Serial.println("NeoPixel Initialized.");
+
+  // Initialize random seed
+  randomSeed(analogRead(0)); // Using A0/0 for a somewhat random seed
+  Serial.println("Random seed initialized.");
 
   initWiFi();
 
@@ -132,7 +136,26 @@ void loop(){
     if (currentTime - lastSendTime >= sendInterval){
       // Update the last send time
       lastSendTime = currentTime;
-      Serial.printf("Program running for %lu ms\n", currentTime);        
+      
+      // --- Generate and Send License Plate ---
+      char CarLicense[11]; // "43A-123.45" is 10 chars + null terminator
+      int province = 43; // Da Nang
+      char series = random('A', 'Z' + 1); // Random letter 'A' through 'Z'
+      int num1 = random(100, 1000); // Random number 100-999
+      int num2 = random(0, 100);    // Random number 0-99
+
+      // Format the string: "43A-230.42"
+      snprintf(CarLicense, 11, "%d%c-%03d.%02d", province, series, num1, num2);
+    
+      String licensePlatePath = "parkingLots/mainStreetGarage/spots/A02/license_plate";
+      
+      Serial.print("Sending license plate: ");
+      Serial.println(CarLicense);
+
+      // Send the data to Firebase
+      // This is an async call. The result will be in processData.
+      Database.set(aClient, licensePlatePath, CarLicense, "sendTask");
+      // ----------------------------------------
     }
   }
 }
@@ -229,6 +252,18 @@ void processData(AsyncResult &aResult){
         Serial.println("Received unexpected data type. Defaulting to 'off'.");
         updateLedStatus("off"); // Default to "off" (Red)
       }
+    }
+    else
+    {
+        // This is the result from our 'sendTask' (or other non-stream tasks)
+        Serial.println("----------------------------");
+        Firebase.printf("Non-stream task: %s\n", aResult.uid().c_str());
+        if (aResult.uid() == "sendTask" && !aResult.isError()) {
+            Serial.println("License plate sent successfully.");
+        }
+        else if (aResult.uid() == "sendTask" && aResult.isError()) {
+            Serial.println("Error sending license plate.");
+        }
     }
   }
 }
