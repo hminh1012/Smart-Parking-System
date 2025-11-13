@@ -1,0 +1,234 @@
+/*
+  Updated Firebase ESP32/ESP8266 Sketch with NeoPixel Integration (v2)
+
+  This code connects to Firebase and listens for changes at:
+  "parkingLots/mainStreetGarage/spots/A02/led_status"
+
+  - If the value is "on", the NeoPixel strip turns Green.
+  - If the value is "off", the NeoPixel strip turns Red.
+*/
+
+#define ENABLE_USER_AUTH
+#define ENABLE_DATABASE
+
+#include <Arduino.h>
+#if defined(ESP32)
+    #include <WiFi.h>
+#elif defined(ESP8266)
+    #include <ESP8266WiFi.h>
+#endif
+#include <WiFiClientSecure.h>
+#include <FirebaseClient.h>
+#include "ExampleFunctions.h" // Provides the functions used in the examples.
+#include <ArduinoJson.h>
+
+#include <Adafruit_NeoPixel.h>
+
+// --- Configuration ---
+// Network and Firebase credentials
+#define WIFI_SSID "Bubuchacha"
+#define WIFI_PASSWORD "umbalaxibua"
+
+#define Web_API_KEY "AIzaSyC58kY22AMwBzdzzOfp66BRBzOZG9Kl8xo"
+#define DATABASE_URL "https://esp-project-5cd9d-default-rtdb.asia-southeast1.firebasedatabase.app/"
+
+#define USER_EMAIL "starsrising8888@gmail.com"
+#define USER_PASS "kuroba12"
+
+// --- NeoPixel Settings (Updated as per your request) ---
+#define PIN_WS2812B 16     // The ESP32 pin connected to WS2812B
+#define NUM_PIXELS 8       // The number of LEDs on your strip
+
+// --- Database Path (Updated as per your request) ---
+String listenerPath = "parkingLots/mainStreetGarage/spots/A02/led_status";
+
+// --- Output Pins ---
+// (Unused in this example, but declared as per original code)
+const int output1 = 12;
+const int output2 = 13;
+const int output3 = 14;
+
+// --- Global Objects ---
+// Authentication
+UserAuth user_auth(Web_API_KEY, USER_EMAIL, USER_PASS);
+SSL_CLIENT ssl_client, stream_ssl_client;
+
+// Firebase components
+FirebaseApp app;
+using AsyncClient = AsyncClientClass;
+AsyncClient aClient(ssl_client), streamClient(stream_ssl_client);
+RealtimeDatabase Database;
+
+// NeoPixel object
+Adafruit_NeoPixel WS2812B(NUM_PIXELS, PIN_WS2812B, NEO_GRB + NEO_KHZ800);
+
+// Timer variables for loop
+unsigned long lastSendTime = 0;
+const unsigned long sendInterval = 10000; // 10 seconds in milliseconds
+
+// --- Function Declarations ---
+void processData(AsyncResult &aResult);
+void setStripColor(uint32_t color);
+void initWiFi();
+void updateLedStatus(String status);
+
+// --- Setup ---
+void setup(){
+  Serial.begin(115200);
+  Serial.println("Firebase + NeoPixel LED Status Demo");
+
+  // Initialize hard-coded output pins
+  pinMode(output1, OUTPUT);
+  pinMode(output2, OUTPUT);
+  pinMode(output3, OUTPUT);
+  digitalWrite(output1, LOW);
+  digitalWrite(output2, LOW);
+  digitalWrite(output3, LOW);
+
+  // Initialize NeoPixel
+  WS2812B.begin();           // INITIALIZE NeoPixel strip
+  WS2812B.setBrightness(50); // Set brightness (0-255)
+  setStripColor(WS2812B.Color(0, 0, 255)); // Set to Blue during init
+  Serial.println("NeoPixel Initialized.");
+
+  initWiFi();
+
+  // Configure SSL client
+  ssl_client.setInsecure();
+  stream_ssl_client.setInsecure();
+  #if defined(ESP32)
+    ssl_client.setConnectionTimeout(1000);
+    ssl_client.setHandshakeTimeout(5);
+    stream_ssl_client.setConnectionTimeout(1000);
+    stream_ssl_client.setHandshakeTimeout(5);
+  #elif defined(ESP8266)
+    ssl_client.setTimeout(1000); // Set connection timeout
+    ssl_client.setBufferSizes(4096, 1024); // Set buffer sizes
+    stream_ssl_client.setTimeout(1000); // Set connection timeout
+    stream_ssl_client.setBufferSizes(4096, 1024); // Set buffer sizes
+  #endif
+
+  // Initialize Firebase
+  initializeApp(aClient, app, getAuth(user_auth), processData, "🔐 authTask");
+  app.getApp<RealtimeDatabase>(Database);
+  Database.url(DATABASE_URL);
+
+  // Set a database listener
+  Serial.print("Setting up listener at: ");
+  Serial.println(listenerPath);
+  streamClient.setSSEFilters("get,put,patch,keep-alive,cancel,auth_revoked");
+  Database.get(streamClient, listenerPath, processData, true /* SSE mode (HTTP Streaming) */, "streamTask");
+}
+
+// --- Main Loop ---
+void loop(){
+  // Maintain authentication and async tasks
+  app.loop();
+
+  // Check if authentication is ready
+  if (app.ready()){
+    //Do nothing - everything works with callback functions
+    unsigned long currentTime = millis();
+    if (currentTime - lastSendTime >= sendInterval){
+      // Update the last send time
+      lastSendTime = currentTime;
+      Serial.printf("Program running for %lu ms\n", currentTime);        
+    }
+  }
+}
+
+// --- NeoPixel Helper Function ---
+void setStripColor(uint32_t color) {
+  for (int pixel = 0; pixel < NUM_PIXELS; pixel++) { // For each pixel 
+    WS2812B.setPixelColor(pixel, color); // Set color 
+  }
+  WS2812B.show(); // Update the strip
+}
+
+// --- WiFi Initialization ---
+void initWiFi() {
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("Connecting to WiFi ..");
+  while (WiFi.status() != WL_CONNECTED) {
+    Serial.print('.');
+    delay(1000);
+  }
+  Serial.println(WiFi.localIP());
+  Serial.println();
+}
+
+// --- LED Status Logic ---
+// Central function to update LED based on the status string
+void updateLedStatus(String status) {
+  status.toLowerCase(); // Ensure consistent comparison
+  
+  if (status == "on") {
+    Serial.println("Status changed: ON");
+    setStripColor(WS2812B.Color(0, 255, 0)); // Green
+  } else if (status == "off") {
+    Serial.println("Status changed: OFF");
+    setStripColor(WS2812B.Color(255, 0, 0)); // Red
+  } else {
+    Serial.print("Status changed: UNKNOWN (");
+    Serial.print(status);
+    Serial.println(")");
+    setStripColor(WS2812B.Color(255, 255, 0)); // Yellow for unknown status
+  }
+}
+
+// --- Firebase Data Callback ---
+void processData(AsyncResult &aResult){
+  // Exits when no result available when calling from the loop.
+  if (!aResult.isResult())
+    return;
+
+  if (aResult.isEvent()){
+    Firebase.printf("Event task: %s, msg: %s, code: %d\n", aResult.uid().c_str(), aResult.eventLog().message().c_str(), aResult.eventLog().code());
+  }
+
+  if (aResult.isDebug()){
+    Firebase.printf("Debug task: %s, msg: %s\n", aResult.uid().c_str(), aResult.debug().c_str());
+  }
+
+  if (aResult.isError()){
+    Firebase.printf("Error task: %s, msg: %s, code: %d\n", aResult.uid().c_str(), aResult.error().message().c_str(), aResult.error().code());
+    // If we get an error, set LED to a warning color (e.g., orange)
+    setStripColor(WS2812B.Color(255, 165, 0));
+  }
+
+  // When it receives data from the database
+  if (aResult.available()){
+    RealtimeDatabaseResult &RTDB = aResult.to<RealtimeDatabaseResult>();
+    // we received data from the streaming client
+    if (RTDB.isStream()) {
+      Serial.println("----------------------------");
+      Firebase.printf("Stream task: %s\n", aResult.uid().c_str());
+      Firebase.printf("Event type: %s\n", RTDB.event().c_str());
+      Firebase.printf("Event path: %s\n", RTDB.dataPath().c_str());
+      Firebase.printf("Data: %s\n", RTDB.to<const char *>());
+      Firebase.printf("Data type: %d\n", RTDB.type());
+
+      /*
+        NEW LOGIC (v2):
+        We are listening to ".../led_status".
+        The data should be a string (type 5): "on" or "off".
+      */
+
+      // Case 1: Data is a String (type 5)
+      if (RTDB.type() == 5) {
+        String status = RTDB.to<String>();
+        updateLedStatus(status);
+      }
+      // Case 2: Data is null (e.g., deleted)
+      else if (RTDB.type() == 0) { // 0 = null
+        Serial.println("Data at path was deleted or is null.");
+        updateLedStatus("off"); // Default to "off" (Red)
+      }
+      // Case 3: Data is something else (e.g., a number, boolean, or JSON)
+      else {
+        Serial.println("Received unexpected data type. Defaulting to 'off'.");
+        updateLedStatus("off"); // Default to "off" (Red)
+      }
+    }
+  }
+}
