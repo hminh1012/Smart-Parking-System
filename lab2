@@ -1,166 +1,49 @@
-/*
-  Updated Firebase ESP32/ESP8266 Sketch with NeoPixel Integration (v2)
-
-  This code connects to Firebase and listens for changes at:
-  "parkingLots/mainStreetGarage/spots/A02/led_status"
-
-  - If the value is "on", the NeoPixel strip turns Green.
-  - If the value is "off", the NeoPixel strip turns Red.
-*/
-
-#define ENABLE_USER_AUTH
-#define ENABLE_DATABASE
-
-#include <Arduino.h>
-#if defined(ESP32)
-    #include <WiFi.h>
-#elif defined(ESP8266)
-    #include <ESP8266WiFi.h>
-#endif
-#include <WiFiClientSecure.h>
-#include <FirebaseClient.h>
-#include "ExampleFunctions.h" // Provides the functions used in the examples.
-#include <ArduinoJson.h>
-
+#include <WiFi.h>
+#include <Firebase_ESP_Client.h>
 #include <Adafruit_NeoPixel.h>
 
-// --- Configuration ---
-// Network and Firebase credentials
+// Provide the token generation process info.
+#include "addons/TokenHelper.h"
+// Provide the real-time database payload printing info.
+#include "addons/RTDBHelper.h"
+
+// --- Insert your network credentials ---
 #define WIFI_SSID "Bubuchacha"
 #define WIFI_PASSWORD "umbalaxibua"
 
-#define Web_API_KEY "AIzaSyC58kY22AMwBzdzzOfp66BRBzOZG9Kl8xo"
+// --- Insert Firebase project API Key ---
+#define API_KEY "AIzaSyC58kY22AMwBzdzzOfp66BRBzOZG9Kl8xo"
+
+// --- Insert real-time database URL ---
 #define DATABASE_URL "https://esp-project-5cd9d-default-rtdb.asia-southeast1.firebasedatabase.app/"
 
-#define USER_EMAIL "starsrising8888@gmail.com"
-#define USER_PASS "kuroba12"
+// --- NeoPixel (WS2812B) Definitions ---
+#define PIN_WS2812B 16 // The ESP32 pin connected to WS2812B
+#define NUM_PIXELS 8  // The number of LEDs on your strip
 
-// --- NeoPixel Settings (Updated as per your request) ---
-#define PIN_WS2812B 16     // The ESP32 pin connected to WS2812B
-#define NUM_PIXELS 8       // The number of LEDs on your strip
-
-// --- Database Path (Updated as per your request) ---
-String listenerPath = "parkingLots/mainStreetGarage/spots/A02/led_status";
-
-// --- Output Pins ---
-// (Unused in this example, but declared as per original code)
-const int output1 = 12;
-const int output2 = 13;
-const int output3 = 14;
-
-// --- Global Objects ---
-// Authentication
-UserAuth user_auth(Web_API_KEY, USER_EMAIL, USER_PASS);
-SSL_CLIENT ssl_client, stream_ssl_client;
-
-// Firebase components
-FirebaseApp app;
-using AsyncClient = AsyncClientClass;
-AsyncClient aClient(ssl_client), streamClient(stream_ssl_client);
-RealtimeDatabase Database;
-
-// NeoPixel object
+// Initialize the NeoPixel strip
 Adafruit_NeoPixel WS2812B(NUM_PIXELS, PIN_WS2812B, NEO_GRB + NEO_KHZ800);
 
-// Timer variables for loop
-unsigned long lastSendTime = 0;
-const unsigned long sendInterval = 3000; // 3 seconds in milliseconds
+// --- Firebase Objects ---
+FirebaseData fbdo; // Main object for sending data
+FirebaseData stream; // Dedicated object for the data stream
 
-// --- Function Declarations ---
-void processData(AsyncResult &aResult);
-void setStripColor(uint32_t color);
-void initWiFi();
-void updateLedStatus(String status);
+FirebaseAuth auth;
+FirebaseConfig config;
 
-// --- Setup ---
-void setup(){
-  Serial.begin(115200);
-  Serial.println("Firebase + NeoPixel LED Status Demo");
+bool signupSuccess = false;
+unsigned long sendLicensePlatePrevMillis = 0;
 
-  // Initialize hard-coded output pins
-  pinMode(output1, OUTPUT);
-  pinMode(output2, OUTPUT);
-  pinMode(output3, OUTPUT);
-  digitalWrite(output1, LOW);
-  digitalWrite(output2, LOW);
-  digitalWrite(output3, LOW);
+// Path to listen to for LED changes
+String streamPath = "parkingLots/mainStreetGarage/spots/A02/led_status";
+// Path to send license plates to
+String licensePlatePath = "detected_plates/last_plate";
 
-  // Initialize NeoPixel
-  WS2812B.begin();           // INITIALIZE NeoPixel strip
-  WS2812B.setBrightness(50); // Set brightness (0-255)
-  setStripColor(WS2812B.Color(0, 0, 255)); // Set to Blue during init
-  Serial.println("NeoPixel Initialized.");
 
-  // Initialize random seed
-  randomSeed(analogRead(0)); // Using A0/0 for a somewhat random seed
-  Serial.println("Random seed initialized.");
-
-  initWiFi();
-
-  // Configure SSL client
-  ssl_client.setInsecure();
-  stream_ssl_client.setInsecure();
-  #if defined(ESP32)
-    ssl_client.setConnectionTimeout(1000);
-    ssl_client.setHandshakeTimeout(5);
-    stream_ssl_client.setConnectionTimeout(1000);
-    stream_ssl_client.setHandshakeTimeout(5);
-  #elif defined(ESP8266)
-    ssl_client.setTimeout(1000); // Set connection timeout
-    ssl_client.setBufferSizes(4096, 1024); // Set buffer sizes
-    stream_ssl_client.setTimeout(1000); // Set connection timeout
-    stream_ssl_client.setBufferSizes(4096, 1024); // Set buffer sizes
-  #endif
-
-  // Initialize Firebase
-  initializeApp(aClient, app, getAuth(user_auth), processData, "🔐 authTask");
-  app.getApp<RealtimeDatabase>(Database);
-  Database.url(DATABASE_URL);
-
-  // Set a database listener
-  Serial.print("Setting up listener at: ");
-  Serial.println(listenerPath);
-  streamClient.setSSEFilters("get,put,patch,keep-alive,cancel,auth_revoked");
-  Database.get(streamClient, listenerPath, processData, true /* SSE mode (HTTP Streaming) */, "streamTask");
-}
-
-// --- Main Loop ---
-void loop(){
-  // Maintain authentication and async tasks
-  app.loop();
-
-  // Check if authentication is ready
-  if (app.ready()){
-    //Do nothing - everything works with callback functions
-    unsigned long currentTime = millis();
-    if (currentTime - lastSendTime >= sendInterval){
-      // Update the last send time
-      lastSendTime = currentTime;
-      
-      // --- Generate and Send License Plate ---
-      char CarLicense[11]; // "43A-123.45" is 10 chars + null terminator
-      int province = 43; // Da Nang
-      char series = random('A', 'Z' + 1); // Random letter 'A' through 'Z'
-      int num1 = random(100, 1000); // Random number 100-999
-      int num2 = random(0, 100);    // Random number 0-99
-
-      // Format the string: "43A-230.42"
-      snprintf(CarLicense, 11, "%d%c-%03d.%02d", province, series, num1, num2);
-    
-      String licensePlatePath = "parkingLots/mainStreetGarage/spots/A02/license_plate";
-      
-      Serial.print("Sending license plate: ");
-      Serial.println(CarLicense);
-
-      // Send the data to Firebase
-      // This is an async call. The result will be in processData.
-      Database.set(aClient, licensePlatePath, CarLicense, "sendTask");
-      // ----------------------------------------
-    }
-  }
-}
-
-// --- NeoPixel Helper Function ---
+/**
+ * @brief Sets all pixels on the strip to a specific color.
+ * @param color A 32-bit color value (e.g., strip.Color(255, 0, 0))
+ */
 void setStripColor(uint32_t color) {
   for (int pixel = 0; pixel < NUM_PIXELS; pixel++) { // For each pixel 
     WS2812B.setPixelColor(pixel, color); // Set color 
@@ -168,102 +51,134 @@ void setStripColor(uint32_t color) {
   WS2812B.show(); // Update the strip
 }
 
-// --- WiFi Initialization ---
-void initWiFi() {
+/**
+ * @brief Generates a random Vietnamese license plate string.
+ * @return A String formatted like "43A-123.01"
+ */
+String generateLicensePlate()
+{
+  int province = 43; // Da Nang
+  char series = random('A', 'Z' + 1); // Random letter 'A' through 'Z'
+  int num1 = random(100, 1000);     // Random number 100-999
+  int num2 = random(0, 100);        // Random number 0-99
+
+  // Buffer to hold the formatted string
+  char licensePlateBuffer[15];
+
+  // Format the string: "43A-230.42"
+  snprintf(licensePlateBuffer, 15, "%d%c-%03d.%02d",
+           province,
+           series,
+           num1,
+           num2);
+
+  return String(licensePlateBuffer);
+}
+
+
+void setup()
+{
+  Serial.begin(115200);
+
+  // Initialize NeoPixel strip
+  WS2812B.begin();
+  WS2812B.show(); // Initialize all pixels to 'off'
+  setStripColor(WS2812B.Color(0, 0, 255)); // Set to Blue while connecting
+
+  // Use a random analog pin for a better random seed
+  randomSeed(analogRead(0));
+
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  Serial.print("Connecting to WiFi ..");
-  while (WiFi.status() != WL_CONNECTED) {
-    Serial.print('.');
-    delay(1000);
+  Serial.print("Connecting to Wi-Fi");
+  while (WiFi.status() != WL_CONNECTED)
+  {
+    Serial.print(".");
+    delay(200);
   }
+  Serial.println("\nConnected to Wi-Fi");
   Serial.println(WiFi.localIP());
-  Serial.println();
-}
 
-// --- LED Status Logic ---
-// Central function to update LED based on the status string
-void updateLedStatus(String status) {
-  status.toLowerCase(); // Ensure consistent comparison
-  
-  if (status == "on") {
-    Serial.println("Status changed: ON");
-    setStripColor(WS2812B.Color(0, 255, 0)); // Green
-  } else if (status == "off") {
-    Serial.println("Status changed: OFF");
-    setStripColor(WS2812B.Color(255, 0, 0)); // Red
-  } else {
-    Serial.print("Status changed: UNKNOWN (");
-    Serial.print(status);
-    Serial.println(")");
-    setStripColor(WS2812B.Color(255, 255, 0)); // Yellow for unknown status
+  // Assigning the project API key and database URL
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+
+  // Check signup status
+  if (Firebase.signUp(&config, &auth, "", ""))
+  {
+    Serial.println("Firebase sign up OK");
+    signupSuccess = true;
+  }
+  else
+  {
+    Serial.printf("Firebase sign up ERROR: %s\n", config.signer.signupError.message.c_str());
+  }
+
+  // Assign the callback function for token generation task
+  config.token_status_callback = tokenStatusCallback;
+
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+
+  // --- Start the Firebase Stream ---
+  // This begins listening for any data changes at the specified path.
+  if (!Firebase.RTDB.beginStream(&stream, streamPath.c_str()))
+  {
+    Serial.printf("Error starting stream: %s\n", stream.errorReason().c_str());
+  }
+  else
+  {
+    Serial.printf("Stream started at path: %s\n", streamPath.c_str());
   }
 }
 
-// --- Firebase Data Callback ---
-void processData(AsyncResult &aResult){
-  // Exits when no result available when calling from the loop.
-  if (!aResult.isResult())
-    return;
+void loop()
+{
+  // Check if Firebase is ready and signup was successful
+  if (Firebase.ready() && signupSuccess)
+  {
+    // --- 1. Check for new data on the stream (for LED) ---
+    // This function checks if new data has arrived on the stream.
+    if (Firebase.RTDB.readStream(&stream))
+    {
+      // Check if the stream has new data available
+      if (stream.streamAvailable())
+      {
+        // Check if the data type is a string (as expected for "on"/"off")
+        if (stream.dataType() == "string")
+        {
+          String status = stream.stringData();
+          Serial.printf("LED Status changed: %s\n", status.c_str());
 
-  if (aResult.isEvent()){
-    Firebase.printf("Event task: %s, msg: %s, code: %d\n", aResult.uid().c_str(), aResult.eventLog().message().c_str(), aResult.eventLog().code());
-  }
-
-  if (aResult.isDebug()){
-    Firebase.printf("Debug task: %s, msg: %s\n", aResult.uid().c_str(), aResult.debug().c_str());
-  }
-
-  if (aResult.isError()){
-    Firebase.printf("Error task: %s, msg: %s, code: %d\n", aResult.uid().c_str(), aResult.error().message().c_str(), aResult.error().code());
-    // If we get an error, set LED to a warning color (e.g., orange)
-    setStripColor(WS2812B.Color(255, 165, 0));
-  }
-
-  // When it receives data from the database
-  if (aResult.available()){
-    RealtimeDatabaseResult &RTDB = aResult.to<RealtimeDatabaseResult>();
-    // we received data from the streaming client
-    if (RTDB.isStream()) {
-      Serial.println("----------------------------");
-      Firebase.printf("Stream task: %s\n", aResult.uid().c_str());
-      Firebase.printf("Event type: %s\n", RTDB.event().c_str());
-      Firebase.printf("Event path: %s\n", RTDB.dataPath().c_str());
-      Firebase.printf("Data: %s\n", RTDB.to<const char *>());
-      Firebase.printf("Data type: %d\n", RTDB.type());
-
-      /*
-        NEW LOGIC (v2):
-        We are listening to ".../led_status".
-        The data should be a string (type 5): "on" or "off".
-      */
-
-      // Case 1: Data is a String (type 5)
-      if (RTDB.type() == 5) {
-        String status = RTDB.to<String>();
-        updateLedStatus(status);
-      }
-      // Case 2: Data is null (e.g., deleted)
-      else if (RTDB.type() == 0) { // 0 = null
-        Serial.println("Data at path was deleted or is null.");
-        updateLedStatus("off"); // Default to "off" (Red)
-      }
-      // Case 3: Data is something else (e.g., a number, boolean, or JSON)
-      else {
-        Serial.println("Received unexpected data type. Defaulting to 'off'.");
-        updateLedStatus("off"); // Default to "off" (Red)
+          if (status == "on")
+          {
+            setStripColor(WS2812B.Color(255, 0, 0)); // Red
+          }
+          else if (status == "off")
+          {
+            setStripColor(WS2812B.Color(0, 255, 0)); // Green
+          }
+          else
+          {
+            setStripColor(WS2812B.Color(0, 0, 0)); // Off for any other value
+          }
+        }
       }
     }
-    else
+
+    // --- 2. Send license plate data every 3 seconds ---
+    if (millis() - sendLicensePlatePrevMillis > 3000)
     {
-        // This is the result from our 'sendTask' (or other non-stream tasks)
-        Serial.println("----------------------------");
-        Firebase.printf("Non-stream task: %s\n", aResult.uid().c_str());
-        if (aResult.uid() == "sendTask" && !aResult.isError()) {
-            Serial.println("License plate sent successfully.");
-        }
-        else if (aResult.uid() == "sendTask" && aResult.isError()) {
-            Serial.println("Error sending license plate.");
-        }
+      sendLicensePlatePrevMillis = millis();
+
+      String licensePlate = generateLicensePlate();
+      Serial.printf("Sending license plate: %s\n", licensePlate.c_str());
+
+      // Send the string to the database
+      if (!Firebase.RTDB.setString(&fbdo, licensePlatePath.c_str(), licensePlate.c_str()))
+      {
+        // If sending failed, print the error
+        Serial.printf("Error sending plate: %s\n", fbdo.errorReason().c_str());
+      }
     }
   }
 }
