@@ -1,65 +1,52 @@
-/*********
- * Combined code for an ESP32 Gateway.
- * This device:
- * 1. Receives data from other ESP32 boards via ESP-NOW.
- * 2. Displays the received data on a local TFT screen using LVGL.
- * 3. Forwards the data to a Firebase Realtime Database.
- * 4. NEW: Calculates the duration when a board's status is '1' (occupied)
- * and sends the duration and revenue to Firebase when the status
- * changes back to '0' (available).
- *
- * All necessary configurations and credentials are included in this single file.
- *
- * --- FIXES APPLIED ---
- * 1. Commented out all references to the missing 'image.h' file to allow compilation.
- * 2. Corrected Firebase path in 'led_button_event_handler' to match JSON structure.
- * 3. Removed 'sendDataToFirebase' function and integrated its logic directly
- * into the main loop.
- * 4. Rewrote the main loop's processing logic to:
- * - Send "occupied" / "available" strings for status.
- * - Send license plate to '/currentVehicle/licensePlate'.
- * - On departure, remove '/currentVehicle' node.
- * - On departure, calculate duration (in hours) and revenue, and send them
- * to the spot's '/duration' and '/revenue' fields.
- * 5. Added a warning for the touchscreen calibration values.
- **********
-*/
-#define ENABLE_USER_AUTH
-#define ENABLE_DATABASE
+
+
 // --- Wi-Fi Credentials ---
-// Replace with your network SSID (name) and password
 #define WIFI_SSID "Bubuchacha"
 #define WIFI_PASSWORD "umbalaxibua"
 
 // --- Firebase Project Credentials ---
-// Replace with your Firebase project's credentials.
 #define WEB_API_KEY "AIzaSyC58kY22AMwBzdzzOfp66BRBzOZG9Kl8xo"
-#define DATABASE_URL "https://esp-project-5cd9d-default-rtdb.asia-southeast1.firebasedatabase.app/" // e.g., "https://your-project-id-default-rtdb.firebaseio.com/"
+#define DATABASE_URL "https://esp-project-5cd9d-default-rtdb.asia-southeast1.firebasedatabase.app/"
 
 // --- Firebase User Authentication ---
-// Replace with the email and password of a user created in Firebase Authentication.
 #define USER_EMAIL "starsrising8888@gmail.com"
 #define USER_PASS "kuroba12"
 
 
+// --- Cấu hình hệ thống ---
+#define ENABLE_USER_AUTH
+#define ENABLE_DATABASE
+#define NUM_BOARDS 2 // --- OPTIMIZED: Quản lý số lượng board
+#define HOURLY_RATE 2.5f // --- OPTIMIZED: Đưa giá tiền ra làm hằng số
+#define FIREBASE_READ_INTERVAL 10000 // Đọc Firebase mỗi 10 giây
+
+// --- Đường dẫn Firebase ---
+// --- OPTIMIZED: Dùng hằng số cho đường dẫn và trạng thái
+const char* FB_BASE_PATH = "/parkingLots/mainStreetGarage/spots";
+const char* FB_STATUS_OCCUPIED = "occupied";
+const char* FB_STATUS_AVAILABLE = "available";
+const char* FB_LED_ON = "on";
+const char* FB_LED_OFF = "off";
+
 // --- Core Libraries ---
 #include <lvgl.h>
 #include <TFT_eSPI.h>
-// --- FIX: --- Commented out missing image file
-// #include <image.h> 
 #include <XPT2046_Touchscreen.h>
 #include <esp_now.h>
 #include <WiFi.h>
 #include <freertos/queue.h>
 
 // --- Firebase Libraries ---
-#include <WiFiClientSecure.h>
-#include <FirebaseClient.h>
+#include <Firebase_ESP_Client.h>
+#include "addons/TokenHelper.h"
+#include "addons/RTDBHelper.h"
 
-// --- MAC Addresses of Remote Boards ---
-// TODO: Replace with the MAC addresses of your remote ESP32 boards
-uint8_t board1_mac[] = {0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x01};
-uint8_t board2_mac[] = {0x24, 0x6F, 0x28, 0x45, 0x53, 0xDC};
+// --- MAC Addresses ---
+// --- OPTIMIZED: Dùng mảng 2D để lưu MAC address
+uint8_t board_macs[NUM_BOARDS][6] = {
+  {0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x01}, // Board 1
+  {0x24, 0x6F, 0x28, 0x45, 0x53, 0xDC}  // Board 2
+};
 
 // --- Display & Touchscreen Configuration ---
 #define XPT2046_IRQ 36
@@ -74,118 +61,158 @@ uint32_t draw_buf[DRAW_BUF_SIZE / 4];
 
 SPIClass touchscreenSPI = SPIClass(VSPI);
 XPT2046_Touchscreen touchscreen(XPT2046_CS, XPT2046_IRQ);
-
-// Touchscreen coordinates: (x, y) and pressure (z)
-int x, y, z;
+int x, y, z; // Tọa độ cảm ứng
 
 // --- ESP-NOW Configuration ---
 QueueHandle_t esp_now_queue;
 
-// Structure to receive data (must match the sender's structure)
 typedef struct struct_message {
-  int id;          // Board ID (e.g., 1 or 2)
-  int status;      // Application-defined status (1 for occupied, 0 for available)
-  char CarLicense[11]; // Null-terminated string for car license
-  int readingId;   // A unique or sequential ID for the reading
+  int id; // 1 hoặc 2
+  int status; // 1 (Occupied) hoặc 0 (Available)
+  char CarLicense[11];
+  int readingId;
 } struct_message;
 
-// Structure for sending LED control commands
 typedef struct led_message {
   int id;
-  bool state; // true for ON, false for OFF
+  bool state;
 } led_message;
 
 // --- Firebase Components ---
-void processData(AsyncResult &aResult); // Forward declaration
-UserAuth user_auth(WEB_API_KEY, USER_EMAIL, USER_PASS);
-FirebaseApp app;
-WiFiClientSecure ssl_client;
-using AsyncClient = AsyncClientClass;
-AsyncClient aClient(ssl_client);
-RealtimeDatabase Database;
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
 
 // --- LVGL GUI Objects ---
-static lv_obj_t * table1;
-static lv_obj_t * table2;
+// --- OPTIMIZED: Dùng mảng để lưu các đối tượng GUI
+static lv_obj_t * info_tables[NUM_BOARDS];
+static lv_obj_t * led_buttons[NUM_BOARDS];
 
-// --- NEW: Variables for Duration Tracking ---
-// NOTE: Status 0 = available, 1 = occupied
-int last_status_board1 = 0;
-int last_status_board2 = 0;
-unsigned long start_time_board1 = 0; // Time in millis()
-unsigned long start_time_board2 = 0; // Time in millis()
+// --- Quản lý trạng thái bãi đỗ ---
+// --- OPTIMIZED: Dùng struct và mảng để quản lý trạng thái
+struct ParkingSpot {
+  int last_status = 0; // 0 = available, 1 = occupied
+  unsigned long start_time = 0;
+};
+ParkingSpot spots[NUM_BOARDS];
 
+// --- Variables for Periodic Firebase Read ---
+unsigned long lastReadMillis = 0;
+
+// --- Helper Function ---
+
+/**
+ * @brief Lấy đường dẫn Firebase cho một vị trí đỗ xe cụ thể.
+ * @param board_id ID của board (1 hoặc 2).
+ * @return String đường dẫn đầy đủ.
+ */
+String getSpotPath(int board_id) {
+  return String(FB_BASE_PATH) + "/A0" + String(board_id);
+}
 
 // --- Callback Functions ---
 
-// Callback function executed when ESP-NOW data is received
 void OnDataRecv(const esp_now_recv_info *recv_info, const uint8_t *incomingData, int len) {
   struct_message myData;
   memcpy(&myData, incomingData, sizeof(myData));
-  // Send received data to a queue to be processed in the main loop
   xQueueSendFromISR(esp_now_queue, &myData, NULL);
 }
 
-// Firebase async result processing callback
-void processData(AsyncResult &aResult) {
-  if (aResult.isError()) {
-    Firebase.printf("Error task: %s, msg: %s, code: %d\n", aResult.uid().c_str(), aResult.error().message().c_str(), aResult.error().code());
+/**
+ * @brief Cập nhật giao diện nút nhấn LED từ trạng thái Firebase.
+ * @param board_id ID của board (1 hoặc 2).
+ * @param state Trạng thái "on" hoặc "off".
+ */
+void update_led_button_ui(int board_id, String state) {
+  int board_index = board_id - 1;
+  if (board_index < 0 || board_index >= NUM_BOARDS) return; // Kiểm tra an toàn
+
+  lv_obj_t* btn = led_buttons[board_index];
+  if (btn == NULL) return;
+
+  if (state == FB_LED_ON) {
+    lv_obj_add_state(btn, LV_STATE_CHECKED);
+  } else {
+    lv_obj_clear_state(btn, LV_STATE_CHECKED);
+  }
+}
+
+/**
+ * @brief Đọc dữ liệu (trạng thái LED) từ Firebase cho một board.
+ * @param board_id ID của board (1 hoặc 2).
+ */
+void readDataFromFirebase(int board_id) {
+  if (!Firebase.ready()) {
+    Serial.println("Firebase is not ready to read data.");
+    return;
+  }
+
+  Serial.printf("--- Reading LED data for Board %d ---\n", board_id);
+
+  String ledPath = getSpotPath(board_id) + "/led_status";
+
+  if (Firebase.RTDB.getString(&fbdo, ledPath)) {
+    String led_state = fbdo.stringData();
+    Serial.printf("Board %d LED Status: %s\n", board_id, led_state.c_str());
+    
+    // Cập nhật GUI cho khớp với Firebase
+    update_led_button_ui(board_id, led_state);
+  } else {
+    Serial.printf("Failed to read LED status for Board %d: %s\n", board_id, fbdo.errorReason().c_str());
   }
 }
 
 // --- GUI Functions ---
-// LVGL: Event handler for the LED control buttons
+
 static void led_button_event_handler(lv_event_t * e) {
-    lv_obj_t * btn = (lv_obj_t *)lv_event_get_target(e);
-    int board_id = (int)lv_event_get_user_data(e);
-    bool led_state = lv_obj_has_state(btn, LV_STATE_CHECKED);
+  lv_obj_t * btn = (lv_obj_t *)lv_event_get_target(e);
+  // --- OPTIMIZED: Lấy board_id (1 hoặc 2) từ user_data
+  int board_id = (int)lv_event_get_user_data(e);
+  int board_index = board_id - 1;
+  bool led_state = lv_obj_has_state(btn, LV_STATE_CHECKED);
 
-    Serial.printf("Board %d LED button toggled. New state: %s\n", board_id, led_state ? "ON" : "OFF");
+  Serial.printf("Board %d LED button toggled. New state: %s\n", board_id, led_state ? "ON" : "OFF");
 
-    // 1. Send ESP-NOW command to the remote board
-    led_message msg;
-    msg.id = board_id;
-    msg.state = led_state;
-    
-    uint8_t *target_mac = (board_id == 1) ? board1_mac : board2_mac;
-    esp_err_t result = esp_now_send(target_mac, (uint8_t *) &msg, sizeof(msg));
+  // 1. Gửi lệnh ESP-NOW
+  led_message msg;
+  msg.id = board_id;
+  msg.state = led_state;
 
-    if (result == ESP_OK) {
-        Serial.println("ESP-NOW command sent successfully.");
-    } else {
-        Serial.println("Error sending ESP-NOW command.");
-    }
-
-    // 2. Update Firebase with the new LED state
-    if (app.ready()) {
-        // --- FIX: --- Corrected the Firebase path to match the JSON structure
-        String path = "/parkingLots/mainStreetGarage/spots/A0" + String(board_id) + "/led_status";
-        Database.set<String>(aClient, path, led_state ? "on" : "off", processData, "UpdateLEDStatus");
-    }
-}
-
-// Function to update the tables on the LVGL display
-void update_table_values(struct_message *myData) {
-  // --- FIX: --- Show "Occupied" / "Available" instead of 1 / 0
-  const char* status_str = (myData->status == 1) ? "Occupied" : "Available";
+  if (board_index < 0 || board_index >= NUM_BOARDS) return; // Kiểm tra an toàn
   
-  if (myData->id == 1) {
-    lv_table_set_cell_value(table1, 0, 1, status_str);
-    lv_table_set_cell_value(table1, 1, 1, (myData->status == 1) ? myData->CarLicense : "--");
-    lv_table_set_cell_value(table1, 2, 1, String(myData->readingId).c_str());
-  } else if (myData->id == 2) {
-    lv_table_set_cell_value(table2, 0, 1, status_str);
-    lv_table_set_cell_value(table2, 1, 1, (myData->status == 1) ? myData->CarLicense : "--");
-    lv_table_set_cell_value(table2, 2, 1, String(myData->readingId).c_str());
+  uint8_t *target_mac = board_macs[board_index];
+  esp_err_t result = esp_now_send(target_mac, (uint8_t *) &msg, sizeof(msg));
+
+  if (result != ESP_OK) {
+    Serial.println("Error sending ESP-NOW command.");
+  }
+
+  // 2. Cập nhật Firebase
+  if (Firebase.ready()) {
+    String path = getSpotPath(board_id) + "/led_status";
+    String state_str = led_state ? FB_LED_ON : FB_LED_OFF;
+    
+    if (!Firebase.RTDB.setString(&fbdo, path, state_str)) {
+      Serial.printf("Firebase setString error: %s\n", fbdo.errorReason().c_str());
+    }
   }
 }
 
-// --- FIX: --- Removed the old 'sendDataToFirebase' function.
-// The logic is now integrated into the main loop.
+void update_table_values(struct_message *myData) {
+  int board_index = myData->id - 1;
+  // --- OPTIMIZED: Kiểm tra index an toàn
+  if (board_index < 0 || board_index >= NUM_BOARDS) return;
 
+  const char* status_str = (myData->status == 1) ? FB_STATUS_OCCUPIED : FB_STATUS_AVAILABLE;
+  lv_obj_t* target_table = info_tables[board_index];
+  
+  lv_table_set_cell_value(target_table, 0, 1, status_str);
+  lv_table_set_cell_value(target_table, 1, 1, (myData->status == 1) ? myData->CarLicense : "--");
+  lv_table_set_cell_value(target_table, 2, 1, String(myData->readingId).c_str());
+}
 
 // --- Touchscreen and Display Driver Functions ---
-// (These are standard setup functions for the display and LVGL)
+// (Không thay đổi - Giữ nguyên các hàm log_print, touchscreen_read)
 
 void log_print(lv_log_level_t level, const char * buf) {
   LV_UNUSED(level);
@@ -193,135 +220,76 @@ void log_print(lv_log_level_t level, const char * buf) {
   Serial.flush();
 }
 
-// --- FIX: --- Commented out unused function that depended on missing 'image.h'
-/*
-void draw_image(void) {
-  LV_IMAGE_DECLARE(my_image);
-  lv_obj_t * img1 = lv_image_create(lv_screen_active());
-  lv_image_set_src(img1, &my_image);
-  lv_img_set_zoom(img1, 128);
-  lv_obj_align(img1, LV_ALIGN_TOP_LEFT, 0, 0);
-}
-*/
-
-// --- FIX: --- Added a global declaration for the image, as it's needed by LVGL
-// even if the file isn't present. Comment it out if you get errors.
-// LV_IMAGE_DECLARE(my_image);
-
-
-// Get the Touchscreen data
 void touchscreen_read(lv_indev_t * indev, lv_indev_data_t * data) {
-  // Checks if Touchscreen was touched, and prints X, Y and Pressure (Z)
   if(touchscreen.tirqTouched() && touchscreen.touched()) {
-    // Get Touchscreen points
     TS_Point p = touchscreen.getPoint();
-
-    // --- FIX: ---
-    // --- WARNING! ---
-    // These calibration values are placeholders. You MUST run a calibration
-    // sketch for your specific XPT2046 screen to get accurate touch points.
-    // Your touch coordinates will be incorrect until you replace these.
-    // --- WARNING! ---
     float alpha_x, beta_x, alpha_y, beta_y, delta_x, delta_y;
-
-    // REPLACE WITH YOUR OWN CALIBRATION VALUES » https://RandomNerdTutorials.com/touchscreen-calibration/
-    alpha_x = -0.000;
-    beta_x = 0.090;
-    delta_x = -33.771;
-    alpha_y = 0.066;
-    beta_y = 0.000;
-    delta_y = -14.632;
-
+    alpha_x = -0.000; beta_x = 0.090; delta_x = -33.771;
+    alpha_y = 0.066; beta_y = 0.000; delta_y = -14.632;
     x = alpha_y * p.x + beta_y * p.y + delta_y;
-    // clamp x between 0 and SCREEN_WIDTH - 1
-    x = max(0, x);
-    x = min(SCREEN_WIDTH - 1, x);
-
+    x = max(0, x); x = min(SCREEN_WIDTH - 1, x);
     y = alpha_x * p.x + beta_x * p.y + delta_x;
-    // clamp y between 0 and SCREEN_HEIGHT - 1
-    y = max(0, y);
-    y = min(SCREEN_HEIGHT - 1, y);
-
-    z = p.z;
-
+    y = max(0, y); y = min(SCREEN_HEIGHT - 1, y);
     data->state = LV_INDEV_STATE_PRESSED;
-
-    // Set the coordinates
     data->point.x = x;
     data->point.y = y;
-
-
   }
   else {
     data->state = LV_INDEV_STATE_RELEASED;
   }
 }
 
+// --- OPTIMIZED: Hàm trợ giúp tạo tab thông tin
+static void create_info_tab(lv_obj_t * parent_tab, int board_index) {
+  lv_obj_t * table = lv_table_create(parent_tab);
+  lv_table_set_cell_value(table, 0, 0, "Status");
+  lv_table_set_cell_value(table, 1, 0, "Car License");
+  lv_table_set_cell_value(table, 2, 0, "Reading ID");
+  lv_table_set_cell_value(table, 0, 1, "--");
+  lv_table_set_cell_value(table, 1, 1, "--");
+  lv_table_set_cell_value(table, 2, 1, "--");
+  lv_obj_center(table);
+  info_tables[board_index] = table; // Lưu tham chiếu vào mảng
+}
+
+// --- OPTIMIZED: Hàm trợ giúp tạo nút LED
+static void create_led_button(lv_obj_t * parent_cont, int board_id) {
+  int board_index = board_id - 1;
+  
+  lv_obj_t* btn = lv_button_create(parent_cont);
+  lv_obj_add_flag(btn, LV_OBJ_FLAG_CHECKABLE);
+  lv_obj_set_size(btn, 200, 50);
+  // --- OPTIMIZED: Truyền board_id (1 hoặc 2) làm user_data
+  lv_obj_add_event_cb(btn, led_button_event_handler, LV_EVENT_VALUE_CHANGED, (void*)board_id);
+  
+  lv_obj_t * label = lv_label_create(btn);
+  lv_label_set_text(label, ("Board " + String(board_id) + " LED").c_str());
+  lv_obj_center(label);
+  
+  led_buttons[board_index] = btn; // Lưu tham chiếu vào mảng
+}
+
 void lv_create_main_gui(void) {
-  // --- FIX: --- This needs to be declared even if the image is commented out,
-  // to prevent a compile error in the line below.
-  LV_IMAGE_DECLARE(my_image);
   lv_obj_t * tabview = lv_tabview_create(lv_screen_active());
   lv_tabview_set_tab_bar_size(tabview, 40);
-  
-  lv_obj_t * tab1 = lv_tabview_add_tab(tabview, "BOARD #1");
-  lv_obj_t * tab2 = lv_tabview_add_tab(tabview, "BOARD #2");
+
+  // --- OPTIMIZED: Dùng vòng lặp tạo tab thông tin
+  for (int i = 0; i < NUM_BOARDS; i++) {
+    String tab_name = "BOARD #" + String(i + 1);
+    lv_obj_t * tab = lv_tabview_add_tab(tabview, tab_name.c_str());
+    create_info_tab(tab, i);
+  }
+
+  // Tab điều khiển LED
   lv_obj_t * tab_control = lv_tabview_add_tab(tabview, "LED Control");
-
-  //config tab1
-  // --- FIX: --- Commented out image display
-  // lv_obj_t * img1 = lv_image_create(tab1);
-  // lv_image_set_src(img1, &my_image);
-  // lv_obj_align(img1, LV_ALIGN_TOP_LEFT, 0, 0);
-
-  table1 = lv_table_create(tab1);
-  lv_table_set_cell_value(table1, 0, 0, "Status");
-  lv_table_set_cell_value(table1, 1, 0, "Car License");
-  lv_table_set_cell_value(table1, 2, 0, "Reading ID");
-  lv_table_set_cell_value(table1, 0, 1, "--");
-  lv_table_set_cell_value(table1, 1, 1, "--");
-  lv_table_set_cell_value(table1, 2, 1, "--");
-  lv_obj_center(table1);
-  
-  //config tab2
-  // --- FIX: --- Commented out image display
-  // lv_obj_t * img2 = lv_image_create(tab2);
-  // lv_image_set_src(img2, &my_image);
-  // lv_obj_align(img2, LV_ALIGN_TOP_LEFT, 0, 0);
-
-  table2 = lv_table_create(tab2);
-  lv_table_set_cell_value(table2, 0, 0, "Status");
-  lv_table_set_cell_value(table2, 1, 0, "Car License");
-  lv_table_set_cell_value(table2, 2, 0, "Reading ID");
-  lv_table_set_cell_value(table2, 0, 1, "--");
-  lv_table_set_cell_value(table2, 1, 1, "--");
-  lv_table_set_cell_value(table2, 2, 1, "--");
-  lv_obj_center(table2);
-
-
-  // LED Control Tab Content
   lv_obj_set_flex_flow(tab_control, LV_FLEX_FLOW_COLUMN);
   lv_obj_set_flex_align(tab_control, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 
-  // Button for Board 1 LED
-  lv_obj_t * btn1 = lv_button_create(tab_control);
-  lv_obj_add_flag(btn1, LV_OBJ_FLAG_CHECKABLE);
-  lv_obj_set_size(btn1, 200, 50);
-  lv_obj_add_event_cb(btn1, led_button_event_handler, LV_EVENT_VALUE_CHANGED, (void*)1);
-  lv_obj_t * label1 = lv_label_create(btn1);
-  lv_label_set_text(label1, "Board 1 LED");
-  lv_obj_center(label1);
-
-  // Button for Board 2 LED
-  lv_obj_t * btn2 = lv_button_create(tab_control);
-  lv_obj_add_flag(btn2, LV_OBJ_FLAG_CHECKABLE);
-  lv_obj_set_size(btn2, 200, 50);
-  lv_obj_add_event_cb(btn2, led_button_event_handler, LV_EVENT_VALUE_CHANGED, (void*)2);
-  lv_obj_t * label2 = lv_label_create(btn2);
-  lv_label_set_text(label2, "Board 2 LED");
-  lv_obj_center(label2);
+  // --- OPTIMIZED: Dùng vòng lặp tạo nút LED
+  for (int i = 0; i < NUM_BOARDS; i++) {
+    create_led_button(tab_control, i + 1); // board_id là 1-based (1, 2)
+  }
 }
-
 
 // --- Main Setup ---
 void setup() {
@@ -347,22 +315,17 @@ void setup() {
   }
   esp_now_register_recv_cb(OnDataRecv);
 
+  // --- OPTIMIZED: Dùng vòng lặp để thêm peer
   esp_now_peer_info_t peerInfo = {};
-  peerInfo.channel = WiFi.channel(); // Use the channel we are connected on
-  peerInfo.encrypt = false;       // No encryption
+  peerInfo.channel = WiFi.channel();
+  peerInfo.encrypt = false;
   
-  // Add Board 1 as a peer
-  memcpy(peerInfo.peer_addr, board1_mac, 6);
-  if (esp_now_add_peer(&peerInfo) != ESP_OK){
-    Serial.println("Failed to add peer 1");
-    return;
-  }
-  
-  // Add Board 2 as a peer
-  memcpy(peerInfo.peer_addr, board2_mac, 6);
-  if (esp_now_add_peer(&peerInfo) != ESP_OK){
-    Serial.println("Failed to add peer 2");
-    return;
+  for (int i = 0; i < NUM_BOARDS; i++) {
+    memcpy(peerInfo.peer_addr, board_macs[i], 6);
+    if (esp_now_add_peer(&peerInfo) != ESP_OK){
+      Serial.printf("Failed to add peer %d\n", i + 1);
+      return;
+    }
   }
 
   esp_now_queue = xQueueCreate(10, sizeof(struct_message));
@@ -385,12 +348,27 @@ void setup() {
   lv_create_main_gui();
 
   // --- Firebase Initialization ---
-  ssl_client.setInsecure();
-  ssl_client.setConnectionTimeout(1000);
-  ssl_client.setHandshakeTimeout(5);
-  initializeApp(aClient, app, getAuth(user_auth), processData, "🔐 authTask");
-  app.getApp<RealtimeDatabase>(Database);
-  Database.url(DATABASE_URL);
+  Serial.println("Initializing Firebase...");
+  config.api_key = WEB_API_KEY;
+  auth.user.email = USER_EMAIL;
+  auth.user.password = USER_PASS;
+  config.database_url = DATABASE_URL;
+  config.token_status_callback = tokenStatusCallback;
+
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+  
+  // --- OPTIMIZED: Đồng bộ trạng thái LED khi khởi động
+  // Đợi Firebase sẵn sàng
+  while (!Firebase.ready()) {
+    Serial.println("Waiting for Firebase connection...");
+    delay(1000);
+  }
+  Serial.println("Firebase connected.");
+  // Đọc trạng thái ban đầu
+  for (int i = 0; i < NUM_BOARDS; i++) {
+    readDataFromFirebase(i + 1);
+  }
 
   Serial.println("Initialization complete. Waiting for data...");
 }
@@ -402,87 +380,91 @@ void loop() {
   lv_tick_inc(5);
   delay(5);
 
-  // Handle Firebase async tasks
-  app.loop();
-
   // Check queue for incoming ESP-NOW messages
   struct_message receivedData;
   if (xQueueReceive(esp_now_queue, &receivedData, 0) == pdTRUE) {
     Serial.printf("Processing data from Board ID: %d, Status: %d\n", receivedData.id, receivedData.status);
-    
-    // --- FIX: --- Refactored logic to use pointers for cleaner code
-    int* last_status;
-    unsigned long* start_time;
-    
-    if (receivedData.id == 1) {
-      last_status = &last_status_board1;
-      start_time = &start_time_board1;
-    } else if (receivedData.id == 2) {
-      last_status = &last_status_board2;
-      start_time = &start_time_board2;
-    } else {
-      Serial.println("Received data from unknown board ID.");
-      return; // Ignore unknown board ID
-    }
 
-    // --- FIX: --- This is the new, combined logic block.
-    // It updates Firebase based on state changes (car arrival/departure).
+    // --- OPTIMIZED: Sử dụng mảng struct để quản lý
+    int board_index = receivedData.id - 1;
+    if (board_index < 0 || board_index >= NUM_BOARDS) {
+      Serial.println("Received data from unknown board ID.");
+      return; // Thoát nếu ID không hợp lệ
+    }
     
-    String spotPath = "/parkingLots/mainStreetGarage/spots/A0" + String(receivedData.id);
-    int current_status_int = receivedData.status; // 1 = occupied, 0 = available
+    ParkingSpot* spot = &spots[board_index];
+    int current_status_int = receivedData.status;
+
+    // --- OPTIMIZED: Tạo một đối tượng JSON để gộp các lệnh ghi
+    FirebaseJson json;
+    String spotPath = getSpotPath(receivedData.id);
 
     // Event starts: Car arrives (status changes to 1)
-    if (current_status_int == 1 && *last_status != 1) {
-      *start_time = millis();
+    if (current_status_int == 1 && spot->last_status != 1) {
+      spot->start_time = millis();
       Serial.printf("Board %d: Car arrived. Timer started.\n", receivedData.id);
 
-      if (app.ready()) {
-        // Set status to "occupied"
-        Database.set<String>(aClient, spotPath + "/status", "occupied", processData, "SetStatusOccupied");
-        
-        // Set current vehicle license plate
-        Database.set<String>(aClient, spotPath + "/currentVehicle/licensePlate", String(receivedData.CarLicense), processData, "SetLicense");
-        
-        // Clear last session's duration/revenue
-        Database.remove(aClient, spotPath + "/duration", processData, "ClearDuration");
-        Database.remove(aClient, spotPath + "/revenue", processData, "ClearRevenue");
+      if (Firebase.ready()) {
+        // --- OPTIMIZATION: Gộp 4 lệnh thành 1 ---
+        json.set("status", FB_STATUS_OCCUPIED);
+        json.set("currentVehicle/licensePlate", String(receivedData.CarLicense));
+        json.set("duration", "null"); // Dùng "null" để xóa node
+        json.set("revenue", "null");  // Dùng "null" để xóa node
+
+        Serial.print("Sending 'Car Arrived' data to Firebase... ");
+        // Dùng updateNode (hoặc setNode) để ghi toàn bộ JSON
+        if (!Firebase.RTDB.updateNode(&fbdo, spotPath, &json)) {
+          Serial.printf("Firebase update error: %s\n", fbdo.errorReason().c_str());
+        } else {
+          Serial.println("OK.");
+        }
       }
-    } 
+    }
     // Event ends: Car leaves (status changes from 1 to 0)
-    else if (current_status_int != 1 && *last_status == 1) {
-      unsigned long duration_ms = millis() - *start_time;
-      
-      // Calculate duration in hours (for revenue)
-      // (float)duration_ms / (milliseconds_per_second * seconds_per_minute * minutes_per_hour)
-      float duration_h = (float)duration_ms / (1000.0f * 60.0f * 60.0f); 
-      
-      // Get hourly rate (hardcoded to 2.5 based on your JSON)
-      float hourly_rate = 2.5;
-      float revenue = duration_h * hourly_rate; 
+    else if (current_status_int != 1 && spot->last_status == 1) {
+      unsigned long duration_ms = millis() - spot->start_time;
+      float duration_h = (float)duration_ms / (1000.0f * 60.0f * 60.0f);
+      float revenue = duration_h * HOURLY_RATE;
 
       Serial.printf("Board %d: Car left. Duration: %.4f hours. Revenue: $%.2f\n", receivedData.id, duration_h, revenue);
 
-      if (app.ready()) {
-        // Set status to "available"
-        Database.set<String>(aClient, spotPath + "/status", "available", processData, "SetStatusAvailable");
+      if (Firebase.ready()) {
+        // --- OPTIMIZATION: Gộp 4 lệnh thành 1 ---
+        json.set("status", FB_STATUS_AVAILABLE);
+        json.set("currentVehicle", "null"); // Xóa toàn bộ node currentVehicle
+        json.set("duration", duration_h);
+        json.set("revenue", revenue);
         
-        // Remove the currentVehicle node entirely
-        Database.remove(aClient, spotPath + "/currentVehicle", processData, "ClearVehicle");
-        
-        // Set the duration and revenue for the completed session
-        Database.set<float>(aClient, spotPath + "/duration", duration_h, processData, "SetDuration");
-        Database.set<float>(aClient, spotPath + "/revenue", revenue, processData, "SetRevenue");
+        Serial.print("Sending 'Car Left' data to Firebase... ");
+        if (!Firebase.RTDB.updateNode(&fbdo, spotPath, &json)) {
+          Serial.printf("Firebase update error: %s\n", fbdo.errorReason().c_str());
+        } else {
+          Serial.println("OK.");
+        }
       }
     }
-    
+
     // Update the last known status
-    *last_status = current_status_int;
+    spot->last_status = current_status_int;
 
-
-    // 1. Update the local display
+    // Cập nhật màn hình (luôn luôn)
     update_table_values(&receivedData);
+  }
 
-    // 2. Forwarding to Firebase is now handled *inside* the logic above.
-    // The old sendDataToFirebase(&receivedData); call is no longer needed.
+  // --- Periodically read data from Firebase ---
+  unsigned long currentMillis = millis();
+  if (currentMillis - lastReadMillis >= FIREBASE_READ_INTERVAL) {
+    lastReadMillis = currentMillis;
+
+    if (Firebase.ready()) {
+      Serial.println();
+      // --- OPTIMIZED: Dùng vòng lặp để đọc dữ liệu
+      for (int i = 0; i < NUM_BOARDS; i++) {
+        readDataFromFirebase(i + 1);
+      }
+      Serial.println();
+    } else {
+      Serial.println("Firebase not ready, skipping periodic read.");
+    }
   }
 }
