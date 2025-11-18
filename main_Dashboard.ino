@@ -36,6 +36,7 @@ const char* FB_LED_OFF = "off";
 #include <WiFi.h>
 #include <freertos/queue.h>
 
+
 // --- Firebase Libraries ---
 #include <Firebase_ESP_Client.h>
 #include "addons/TokenHelper.h"
@@ -44,7 +45,7 @@ const char* FB_LED_OFF = "off";
 // --- MAC Addresses ---
 // --- OPTIMIZED: Dùng mảng 2D để lưu MAC address
 uint8_t board_macs[NUM_BOARDS][6] = {
-  {0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x01}, // Board 1
+  {0x08, 0xF9, 0xE0, 0xEC, 0xF5, 0xA4}, // Board 1
   {0x24, 0x6F, 0x28, 0x45, 0x53, 0xDC}  // Board 2
 };
 
@@ -141,22 +142,46 @@ void update_led_button_ui(int board_id, String state) {
  * @brief Đọc dữ liệu (trạng thái LED) từ Firebase cho một board.
  * @param board_id ID của board (1 hoặc 2).
  */
+/**
+ * @brief Reads LED status from Firebase, updates GUI, AND syncs via ESP-NOW.
+ * @param board_id ID of the board (1 or 2).
+ */
 void readDataFromFirebase(int board_id) {
   if (!Firebase.ready()) {
     Serial.println("Firebase is not ready to read data.");
     return;
   }
 
-  Serial.printf("--- Reading LED data for Board %d ---\n", board_id);
-
   String ledPath = getSpotPath(board_id) + "/led_status";
 
+  // Read string data ("on" or "off")
   if (Firebase.RTDB.getString(&fbdo, ledPath)) {
-    String led_state = fbdo.stringData();
-    Serial.printf("Board %d LED Status: %s\n", board_id, led_state.c_str());
-    
-    // Cập nhật GUI cho khớp với Firebase
-    update_led_button_ui(board_id, led_state);
+    String led_state_str = fbdo.stringData();
+    bool isLedOn = (led_state_str == FB_LED_ON);
+
+    // --- 1. Update Local GUI ---
+    update_led_button_ui(board_id, led_state_str);
+
+    // --- 2. Send Command via ESP-NOW ---
+    // Calculate array index
+    int board_index = board_id - 1; 
+
+    if (board_index >= 0 && board_index < NUM_BOARDS) {
+      // Prepare the message
+      led_message msg;
+      msg.id = board_id;
+      msg.state = isLedOn; // Convert to boolean for the struct
+
+      // Send to the specific MAC address of this board
+      esp_err_t result = esp_now_send(board_macs[board_index], (uint8_t *) &msg, sizeof(msg));
+
+      if (result == ESP_OK) {
+        Serial.printf(">> Synced Board %d LED: %s (Firebase -> GUI -> ESP-NOW)\n", board_id, led_state_str.c_str());
+      } else {
+        Serial.printf(">> Error syncing Board %d via ESP-NOW\n", board_id);
+      }
+    }
+
   } else {
     Serial.printf("Failed to read LED status for Board %d: %s\n", board_id, fbdo.errorReason().c_str());
   }
@@ -297,7 +322,7 @@ void setup() {
   Serial.println("ESP32 Gateway Initializing...");
 
   // --- Wi-Fi Connection ---
-  WiFi.mode(WIFI_STA);
+  WiFi.mode(WIFI_AP_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   Serial.print("Connecting to Wi-Fi");
   while (WiFi.status() != WL_CONNECTED) {
