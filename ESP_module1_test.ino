@@ -1,46 +1,54 @@
-/*********
-  Merged ESP-NOW Transceiver Code
-  - Sends "struct_message" every 1 second
-  - Receives "struct_message" from its peer
-  
-  - FIXED CALLBACK SIGNATURES (Oct 28, 2025)
-*********/
-
 #include <esp_now.h>
-#include <WiFi.h>
+#include <esp_wifi.h> // Cần thiết để thiết lập kênh Wi-Fi
 
 
-// --- ADDED FROM WS2812.ino ---
+
+// --- THƯ VIỆN & CẤU HÌNH WS2812B ---
 #include <Adafruit_NeoPixel.h>
 #ifdef __AVR__
-#include <avr/power.h> // Required for 16 MHz Adafruit Trinket
+#include <avr/power.h> // Cần thiết cho Adafruit Trinket 16 MHz
 #endif
 
-#define PIN_WS2812B 16  // The ESP32 pin connected to WS2812B
-#define NUM_PIXELS 8  // The number of LEDs on your strip
-// ------------------------------
+#define PIN_WS2812B 16 // Chân ESP32 kết nối với WS2812B
+#define NUM_PIXELS 8 // Số lượng LED trên dải
+// ------------------------------------
+
+// --- CẤU HÌNH WIFI (QUAN TRỌNG) ---
+// Vui lòng thay thế bằng SSID Wi-Fi thực tế của bạn
+constexpr char WIFI_SSID[] = "Bubuchacha";
+
+// Hàm tìm kiếm kênh của SSID Wi-Fi (Cần thiết cho ESP-NOW)
+int32_t getWiFiChannel(const char *ssid) {
+  if (int32_t n = WiFi.scanNetworks()) {
+      for (uint8_t i=0; i<n; i++) {
+          if (!strcmp(ssid, WiFi.SSID(i).c_str())) {
+              return WiFi.channel(i);
+          }
+      }
+  }
+  return 0; // Trả về 0 nếu không tìm thấy
+}
+// ------------------------------------
 
 
 // ------------------------------------------------
-// !! IMPORTANT !!
-// UPDATE THESE MAC ADDRESSES TO MATCH YOUR BOARDS
+// !! ĐỊA CHỈ MAC CỦA CÁC THIẾT BỊ !!
+// CẬP NHẬT ĐỊA CHỈ NÀY PHÙ HỢP VỚI CÁC BOARD CỦA BẠN
 // ------------------------------------------------
 uint8_t macAddress1[] = {0x3C, 0x8A, 0x1F, 0xAB, 0xF9, 0x34};
 uint8_t macAddress2[] = {0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x02};
 // ------------------------------------------------
 
-uint8_t peerAddress[6]; // MAC Address of the *other* board
-int boardId;             // This board's ID (1 or 2)
+uint8_t peerAddress[6]; // Địa chỉ MAC của board đối diện
+int boardId;             // ID của board này (1 hoặc 2)
 
 
-// --- ADDED FROM WS2812.ino ---
+// --- KHỞI TẠO WS2812B ---
 Adafruit_NeoPixel WS2812B(NUM_PIXELS, PIN_WS2812B, NEO_GRB + NEO_KHZ800);
 // ------------------------------
 
 
-
-// This structure will be used for *both* sending and receiving
-// It's from your first "sender" code.
+// Cấu trúc dùng để GỬI dữ liệu (Giống như code gốc của bạn)
 typedef struct {
   int id;
   int status;
@@ -49,201 +57,207 @@ typedef struct {
 } struct_message;
 
 
-// Structure for sending LED control commands
+// Cấu trúc dùng để NHẬN lệnh điều khiển LED
 typedef struct led_message {
   int id;
-  bool state; // true for ON, false for OFF
+  bool state; // true (BẬT), false (TẮT)
 } led_message;
 
-// Create one struct for sending data
+// Tạo biến cấu trúc để gửi
 struct_message myData;
 
-// Create one struct for receiving data
+// Tạo biến cấu trúc để nhận
 led_message incomingData;
 
-// ESP-NOW peer info
+// Thông tin Peer ESP-NOW
 esp_now_peer_info_t peerInfo;
 
-// Variables for sending data (from your sender code)
+// Biến cho việc gửi dữ liệu
 unsigned long previousMillis = 0;
-const long interval = 5000; // Send data every 1 second
+const long interval = 5000; // Gửi dữ liệu sau mỗi 5 giây
 unsigned int readingId = 0;
 
-// --- NEW HELPER FUNCTIONS ---
-// Sets all pixels to a specific color
+// --- HÀM HỖ TRỢ ---
+// Thiết lập tất cả các pixel LED về một màu cụ thể
 void setStripColor(uint32_t color) {
-  for (int pixel = 0; pixel < NUM_PIXELS; pixel++) { // For each pixel 
-    WS2812B.setPixelColor(pixel, color); // Set color 
+  for (int pixel = 0; pixel < NUM_PIXELS; pixel++) { // Lặp qua từng pixel
+    WS2812B.setPixelColor(pixel, color); // Thiết lập màu
   }
-  WS2812B.show(); // Update the strip [cite: 10]
+  WS2812B.show(); // Cập nhật dải LED
 }
 // ------------------------------
 
 
 // ------------------------------------------------
-// CALLBACKS (Event-driven functions)
+// HÀM GỌI LẠI (CALLBACKS)
 // ------------------------------------------------
 
-// 1. Callback when data is SENT (from your sender code)
-// FIXED: Changed signature from (const uint8_t*, ...) to (const wifi_tx_info_t*, ...)
-//        to match your compiler's expectation.
-// NOTE: The 'mac_addr' parameter in this version is not the MAC address,
-//       so we can't print it. We'll just print the status.
+// 1. Hàm gọi lại khi dữ liệu được GỬI
 void OnDataSent(const wifi_tx_info_t* mac_addr, esp_now_send_status_t status) {
-  Serial.print("Send Status:\t");
-  Serial.println(status == ESP_NOW_SEND_SUCCESS ? "Delivery Success" : "Delivery Fail");
+  Serial.print("Trạng thái gửi: ");
+  Serial.println(status == ESP_NOW_SEND_SUCCESS ? "Gửi thành công" : "Gửi thất bại");
 }
 
-// 2. Callback when data is RECEIVED (from your receiver code)
-// FIXED: Changed signature from (const uint8_t*, ...) to (const esp_now_recv_info*, ...)
-//        and updated body to use 'recv_info->src_addr'
+// 2. Hàm gọi lại khi dữ liệu được NHẬN
 void OnDataRecv(const esp_now_recv_info *recv_info, const uint8_t *incomingDataBytes, int len) {
   
-  // Check if the data length matches our structure
+  // Kiểm tra xem độ dài dữ liệu có khớp với cấu trúc led_message hay không
   if (len == sizeof(incomingData)) {
-    // Copy the raw bytes into our "incomingData" struct
+    // Sao chép byte thô vào cấu trúc incomingData
     memcpy(&incomingData, incomingDataBytes, sizeof(incomingData));
 
-    // Print the received data
-    Serial.println();
-    Serial.println("--- PACKET RECEIVED ---");
-    Serial.print("Bytes received: ");
+    // In dữ liệu nhận được
+    Serial.println("\n--- GÓI DỮ LIỆU ĐÃ NHẬN ---");
+    Serial.print("Bytes nhận được: ");
     Serial.println(len);
-    Serial.print("From Board ID: ");
+    Serial.print("Từ Board ID: ");
     Serial.println(incomingData.id);
-    Serial.print("Led Status: ");
-    Serial.println(incomingData.state);
+    Serial.print("Trạng thái Led: ");
+    Serial.println(incomingData.state ? "ON (BẬT)" : "OFF (TẮT)");
     Serial.println("-----------------------------------");
-    Serial.println();
-  // --- NEW LOGIC TO CONTROL WS2812B ---
-    if (incomingData.state == true) { // state is 1
-      Serial.println("Setting strip to RED");
-      setStripColor(WS2812B.Color(255, 0, 0)); // Set all to RED 
-    } else { // state is 0 or false
-      Serial.println("Setting strip to GREEN");
-      setStripColor(WS2812B.Color(0, 255, 0)); // Set all to GREEN [cite: 3]
+    
+
+  // --- LOGIC ĐIỀU KHIỂN WS2812B ---
+    if (incomingData.state == true) { 
+      Serial.println("Thiết lập dải LED thành MÀU ĐỎ");
+      setStripColor(WS2812B.Color(255, 0, 0)); // Đặt tất cả thành ĐỎ 
+    } else { 
+      Serial.println("Thiết lập dải LED thành MÀU XANH LÁ");
+      setStripColor(WS2812B.Color(0, 255, 0)); // Đặt tất cả thành XANH LÁ
     }
-    // --- END NEW LOGIC ---
+    // --- KẾT THÚC LOGIC MỚI ---
 
 
-    // Print the sender's MAC address (FIXED: using recv_info->src_addr)
+    // In địa chỉ MAC của người gửi
     char macStr[18];
     snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
-             recv_info->src_addr[0], recv_info->src_addr[1], recv_info->src_addr[2],
-             recv_info->src_addr[3], recv_info->src_addr[4], recv_info->src_addr[5]);
-    Serial.print("From MAC: ");
+              recv_info->src_addr[0], recv_info->src_addr[1], recv_info->src_addr[2],
+              recv_info->src_addr[3], recv_info->src_addr[4], recv_info->src_addr[5]);
+    Serial.print("Từ MAC: ");
     Serial.println(macStr);
     Serial.println("-----------------------");
     Serial.println();
 
   } else {
-    Serial.println("Received data length mismatch!");
+    Serial.println("Độ dài dữ liệu nhận được không khớp!");
   }
 }
 
 // ------------------------------------------------
-// SETUP
+// THIẾT LẬP (SETUP)
 // ------------------------------------------------
 void setup() {
   Serial.begin(115200);
-  delay(1000); // Give serial time to start
-// --- ADDED FROM WS2812.ino ---
-  WS2812B.begin();  // INITIALIZE WS2812B strip object 
+  delay(1000); // Đợi Serial bắt đầu
+// --- KHỞI TẠO WS2812B ---
+  WS2812B.begin();  // Khởi tạo đối tượng dải WS2812B 
   WS2812B.clear();
-  setStripColor(WS2812B.Color(0, 255, 0)); // Set default color to GREEN
-  Serial.println("LED Strip set to GREEN");
-  // ------------------------------
+  setStripColor(WS2812B.Color(0, 255, 0)); // Đặt màu mặc định là XANH LÁ
+  Serial.println("Dải LED đã được đặt thành XANH LÁ");
+// ------------------------------
 
-  // Set device as a Wi-Fi Station
+  // Thiết lập thiết bị là Trạm Wi-Fi
   WiFi.mode(WIFI_STA);
+  
+  // --- LOGIC THIẾT LẬP KÊNH (Đã thêm) ---
+  int32_t channel = getWiFiChannel(WIFI_SSID);
+  if (channel != 0) {
+    Serial.printf("Tìm thấy kênh WiFi: %d\n", channel);
+    // Thiết lập kênh cho ESP32
+    esp_wifi_set_promiscuous(true);
+    esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
+    esp_wifi_set_promiscuous(false);
+  } else {
+    Serial.println("Cảnh báo: Không thể xác định kênh WiFi. Đang sử dụng kênh mặc định.");
+    channel = 0; // Đảm bảo kênh là 0 nếu không tìm thấy
+  }
+  // -------------------------------------
 
-  // --- Identify This Board ---
+  // --- Xác định Board này ---
   uint8_t myMac[6];
   WiFi.macAddress(myMac);
-  Serial.print("My MAC Address: ");
+  Serial.print("Địa chỉ MAC của tôi: ");
   char myMacStr[18];
   snprintf(myMacStr, sizeof(myMacStr), "%02X:%02X:%02X:%02X:%02X:%02X",
-           myMac[0], myMac[1], myMac[2], myMac[3], myMac[4], myMac[5]);
+            myMac[0], myMac[1], myMac[2], myMac[3], myMac[4], myMac[5]);
   Serial.println(myMacStr);
   
-  // Check if we are Board 1 or Board 2
+  // Kiểm tra xem chúng ta là Board 1 hay Board 2
   if (memcmp(myMac, macAddress1, 6) == 0) {
     boardId = 1;
-    memcpy(peerAddress, macAddress2, 6); // Set peer to Board 2
-    Serial.println("I am Board 1. Sending to Board 2.");
+    memcpy(peerAddress, macAddress2, 6); // Đặt peer là Board 2
+    Serial.println("Tôi là Board 1. Gửi đến Board 2.");
   } else {
-    // Assume we are Board 2 (or default)
+    // Giả sử là Board 2 (hoặc mặc định)
     boardId = 2;
-    memcpy(peerAddress, macAddress1, 6); // Set peer to Board 1
-    Serial.println("I am Board 2. Sending to Board 1.");
+    memcpy(peerAddress, macAddress1, 6); // Đặt peer là Board 1
+    Serial.println("Tôi là Board 2. Gửi đến Board 1.");
   }
   // -----------------------------
 
-  // Initialize ESP-NOW
+  // Khởi tạo ESP-NOW
   if (esp_now_init() != ESP_OK) {
-    Serial.println("Error initializing ESP-NOW");
+    Serial.println("Lỗi khi khởi tạo ESP-NOW");
     return;
   }
 
-  // Register *both* callbacks
-  esp_now_register_send_cb(OnDataSent); // For sending
-  esp_now_register_recv_cb(OnDataRecv); // For receiving
+  // Đăng ký cả hai hàm gọi lại
+  esp_now_register_send_cb(OnDataSent); // Cho việc gửi
+  esp_now_register_recv_cb(OnDataRecv); // Cho việc nhận
 
-  // Register peer (the *other* board)
+  // Đăng ký peer (board đối diện)
   memcpy(peerInfo.peer_addr, peerAddress, 6);
-  peerInfo.channel = 0;
+  peerInfo.channel = channel; // Thiết lập kênh peer
   peerInfo.encrypt = false;
 
-  // Add peer
+  // Thêm peer
   if (esp_now_add_peer(&peerInfo) != ESP_OK) {
-    Serial.println("Failed to add peer");
+    Serial.println("Thêm peer thất bại");
     return;
   }
 
-  // Seed random generator
+  // Khởi tạo bộ tạo số ngẫu nhiên
   randomSeed(analogRead(0));
 }
 
 // ------------------------------------------------
-// LOOP
+// VÒNG LẶP (LOOP)
 // ------------------------------------------------
 void loop() {
-  // This part of the loop is the "sender" logic
+  // Phần logic GỬI dữ liệu
   unsigned long currentMillis = millis();
   if (currentMillis - previousMillis >= interval) {
     previousMillis = currentMillis;
 
-    // Set values to send
-    myData.id = boardId; // Use our dynamic boardId
-    myData.status = random(2); // Random 0 or 1
+    // Đặt giá trị để gửi
+    myData.id = boardId; // Sử dụng Board ID động của chúng ta
+    myData.status = random(2); // Ngẫu nhiên 0 hoặc 1 (Ví dụ: Trạng thái đậu xe)
 
-// --- Generate random Vietnamese license plate ---
-    int province = 43; // Using '43' from your Da Nang example
-    char series = random('A', 'Z' + 1); // Random letter 'A' through 'Z'
-    int num1 = random(100, 1000); // Random number 100-999
-    int num2 = random(0, 100);    // Random number 0-99
+// --- Tạo biển số xe ngẫu nhiên (Ví dụ: Việt Nam) ---
+    int province = 43; // Mã tỉnh '43' (Ví dụ: Đà Nẵng)
+    char series = random('A', 'Z' + 1); // Chữ cái ngẫu nhiên
+    int num1 = random(100, 1000); // Số ngẫu nhiên 3 chữ số
+    int num2 = random(0, 100);    // Số ngẫu nhiên 2 chữ số
 
-    // Format the string: "43A-230.42"
-    // snprintf is a safe way to create formatted strings
+    // Định dạng chuỗi: "43A-230.42"
     snprintf(myData.CarLicense, 10, "%d%c-%03d.%02d",
-             province,
-             series,
-             num1,
-             num2);
-    // ------------------------------------------------
+              province,
+              series,
+              num1,
+              num2);
+// ------------------------------------------------
 
     myData.readingId = readingId++;
 
-    // Send the data
+    // Gửi dữ liệu
     esp_err_t result = esp_now_send(peerAddress, (uint8_t *) &myData, sizeof(myData));
 
-    // Print a quick status of the send attempt
-    Serial.print("Sending data (Reading ID: ");
+    // In trạng thái gửi
+    Serial.print("Đang gửi dữ liệu (Reading ID: ");
     Serial.print(myData.readingId);
     Serial.print("): ");
-    Serial.println(result == ESP_OK ? "Sent" : "Failed to send");
+    Serial.println(result == ESP_OK ? "Đã gửi" : "Gửi thất bại");
   }
 
-  // The "receiver" part requires no code here.
-  // It works entirely in the background via the OnDataRecv callback.
+  // Phần nhận hoạt động hoàn toàn ở chế độ nền thông qua hàm gọi lại OnDataRecv.
 }
