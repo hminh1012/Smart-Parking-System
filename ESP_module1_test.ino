@@ -1,5 +1,6 @@
 #include <esp_now.h>
 #include <esp_wifi.h> // Cần thiết để thiết lập kênh Wi-Fi
+#include <WiFi.h>
 
 
 
@@ -35,12 +36,12 @@ int32_t getWiFiChannel(const char *ssid) {
 // !! ĐỊA CHỈ MAC CỦA CÁC THIẾT BỊ !!
 // CẬP NHẬT ĐỊA CHỈ NÀY PHÙ HỢP VỚI CÁC BOARD CỦA BẠN
 // ------------------------------------------------
-uint8_t macAddress1[] = {0x3C, 0x8A, 0x1F, 0xAB, 0xF9, 0x34};
-uint8_t macAddress2[] = {0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x02};
+uint8_t macAddress[] = {0x3C, 0x8A, 0x1F, 0xAB, 0xF9, 0x34};
+
 // ------------------------------------------------
 
 uint8_t peerAddress[6]; // Địa chỉ MAC của board đối diện
-int boardId;             // ID của board này (1 hoặc 2)
+#define boardId 3;             // ID của board này (1 hoặc 2)
 
 
 // --- KHỞI TẠO WS2812B ---
@@ -181,18 +182,10 @@ void setup() {
   snprintf(myMacStr, sizeof(myMacStr), "%02X:%02X:%02X:%02X:%02X:%02X",
             myMac[0], myMac[1], myMac[2], myMac[3], myMac[4], myMac[5]);
   Serial.println(myMacStr);
+
+  memcpy(peerAddress, macAddress, 6);
   
-  // Kiểm tra xem chúng ta là Board 1 hay Board 2
-  if (memcmp(myMac, macAddress1, 6) == 0) {
-    boardId = 1;
-    memcpy(peerAddress, macAddress2, 6); // Đặt peer là Board 2
-    Serial.println("Tôi là Board 1. Gửi đến Board 2.");
-  } else {
-    // Giả sử là Board 2 (hoặc mặc định)
-    boardId = 2;
-    memcpy(peerAddress, macAddress1, 6); // Đặt peer là Board 1
-    Serial.println("Tôi là Board 2. Gửi đến Board 1.");
-  }
+
   // -----------------------------
 
   // Khởi tạo ESP-NOW
