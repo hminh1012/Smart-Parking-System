@@ -20,7 +20,7 @@
 #define MAX_BOARDS 10        
 #define HOURLY_RATE 2.5f     
 #define FIREBASE_READ_INTERVAL 10000 
-#define CONNECTION_TIMEOUT_MS 60000  
+#define CONNECTION_TIMEOUT_MS 15000  
 #define CHECK_TIMEOUT_INTERVAL 5000  
 
 int current_boards = 2; 
@@ -313,6 +313,13 @@ void setup() {
     memcpy(peerInfo.peer_addr, board_macs[i], 6);
     esp_now_add_peer(&peerInfo);
   }
+
+  // --- Broadcast Peer Registration ---
+  uint8_t broadcastAddress[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+  memcpy(peerInfo.peer_addr, broadcastAddress, 6);
+  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+    Serial.println("Failed to add broadcast peer");
+  }
   
   // --- Update Queue to hold Wrapper Struct ---
   esp_now_queue = xQueueCreate(10, sizeof(GatewayMessage)); 
@@ -421,5 +428,15 @@ void loop() {
     if (Firebase.ready()) {
       for (int i = 0; i < current_boards; i++) readDataFromFirebase(i + 1);
     }
+  }
+
+  // --- BROADCAST BEACON ---
+  static unsigned long lastBroadcast = 0;
+  if (millis() - lastBroadcast > 5000) {
+    lastBroadcast = millis();
+    const char *beaconMsg = "DISCOVER_MASTER";
+    uint8_t broadcastAddress[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+    esp_now_send(broadcastAddress, (uint8_t *)beaconMsg, strlen(beaconMsg) + 1);
+    Serial.println("Broadcasting discovery message...");
   }
 }
