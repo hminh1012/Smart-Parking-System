@@ -1,6 +1,7 @@
 #include <esp_now.h>
 #include <esp_wifi.h> // Cần thiết để thiết lập kênh Wi-Fi
 #include <WiFi.h>
+#include <vector>
 
 
 
@@ -10,8 +11,12 @@
 #include <avr/power.h> // Cần thiết cho Adafruit Trinket 16 MHz
 #endif
 
-#define PIN_WS2812B 16 // Chân ESP32 kết nối với WS2812B
+#define WAKEUP_PIN GPIO_NUM_13 // Chân cảm biến kích hoạt (chờ tín hiệu HIGH)
+#define BUZZZER_PIN 15         // Chân Piezo Buzzer
+#define PIN_WS2812B 14          // Chân LED báo hiệu nhận tín hiệu
 #define NUM_PIXELS 8 // Số lượng LED trên dải
+#define boardId 2;             // ID của board này (1 hoặc 2)
+
 // ------------------------------------
 
 // --- CẤU HÌNH WIFI (QUAN TRỌNG) ---
@@ -41,7 +46,10 @@ uint8_t macAddress[] = {0x3C, 0x8A, 0x1F, 0xAB, 0xF9, 0x34};
 // ------------------------------------------------
 
 uint8_t peerAddress[6]; // Địa chỉ MAC của board đối diện
-#define boardId 3;             // ID của board này (1 hoặc 2)
+
+// List of known masters
+std::vector<std::vector<uint8_t>> masters;
+
 
 
 // --- KHỞI TẠO WS2812B ---
@@ -75,7 +83,9 @@ esp_now_peer_info_t peerInfo;
 
 // Biến cho việc gửi dữ liệu
 unsigned long previousMillis = 0;
-const long interval = 5000; // Gửi dữ liệu sau mỗi 5 giây
+// Biến cho việc gửi dữ liệu
+unsigned long lastDebounceTime = 0;
+const long debounceDelay = 1000; // 1 second debounce
 unsigned int readingId = 0;
 
 // --- HÀM HỖ TRỢ ---
@@ -102,6 +112,46 @@ void OnDataSent(const wifi_tx_info_t* mac_addr, esp_now_send_status_t status) {
 // 2. Hàm gọi lại khi dữ liệu được NHẬN
 void OnDataRecv(const esp_now_recv_info *recv_info, const uint8_t *incomingDataBytes, int len) {
   
+  // Check for broadcast message
+  if (recv_info->des_addr[0] == 0xFF && recv_info->des_addr[1] == 0xFF && 
+      recv_info->des_addr[2] == 0xFF && recv_info->des_addr[3] == 0xFF && 
+      recv_info->des_addr[4] == 0xFF && recv_info->des_addr[5] == 0xFF) {
+    
+    Serial.printf("Broadcast received from: %02X:%02X:%02X:%02X:%02X:%02X\n",
+                  recv_info->src_addr[0], recv_info->src_addr[1], recv_info->src_addr[2],
+                  recv_info->src_addr[3], recv_info->src_addr[4], recv_info->src_addr[5]);
+
+    // Check if already known
+    bool known = false;
+    for (const auto& master : masters) {
+      if (memcmp(master.data(), recv_info->src_addr, 6) == 0) {
+        known = true;
+        break;
+      }
+    }
+
+    if (!known) {
+      Serial.println("New Master detected! Registering...");
+      std::vector<uint8_t> newMaster(recv_info->src_addr, recv_info->src_addr + 6);
+      masters.push_back(newMaster);
+
+      // Register as peer
+      esp_now_peer_info_t newPeerInfo = {};
+      memcpy(newPeerInfo.peer_addr, recv_info->src_addr, 6);
+      newPeerInfo.channel = WiFi.channel(); // Assuming same channel
+      newPeerInfo.encrypt = false;
+
+      if (esp_now_add_peer(&newPeerInfo) == ESP_OK) {
+        Serial.println("Master registered successfully.");
+        // Optionally update the primary peerAddress to the latest master
+        memcpy(peerAddress, recv_info->src_addr, 6);
+      } else {
+        Serial.println("Failed to register Master.");
+      }
+    }
+    return; // Don't process broadcast as LED command
+  }
+
   // Kiểm tra xem độ dài dữ liệu có khớp với cấu trúc led_message hay không
   if (len == sizeof(incomingData)) {
     // Sao chép byte thô vào cấu trúc incomingData
@@ -155,6 +205,10 @@ void setup() {
   WS2812B.clear();
   setStripColor(WS2812B.Color(0, 255, 0)); // Đặt màu mặc định là XANH LÁ
   Serial.println("Dải LED đã được đặt thành XANH LÁ");
+
+  pinMode(WAKEUP_PIN, INPUT);
+  pinMode(BUZZZER_PIN, OUTPUT);
+  digitalWrite(BUZZZER_PIN, LOW);
 // ------------------------------
 
   // Thiết lập thiết bị là Trạm Wi-Fi
@@ -218,39 +272,58 @@ void setup() {
 // ------------------------------------------------
 void loop() {
   // Phần logic GỬI dữ liệu
-  unsigned long currentMillis = millis();
-  if (currentMillis - previousMillis >= interval) {
-    previousMillis = currentMillis;
+  int reading = digitalRead(WAKEUP_PIN);
 
-    // Đặt giá trị để gửi
-    myData.id = boardId; // Sử dụng Board ID động của chúng ta
-    myData.status = random(2); // Ngẫu nhiên 0 hoặc 1 (Ví dụ: Trạng thái đậu xe)
+  if (reading == HIGH) {
+    if ((millis() - lastDebounceTime) > debounceDelay) {
+      lastDebounceTime = millis();
 
-// --- Tạo biển số xe ngẫu nhiên (Ví dụ: Việt Nam) ---
-    int province = 43; // Mã tỉnh '43' (Ví dụ: Đà Nẵng)
-    char series = random('A', 'Z' + 1); // Chữ cái ngẫu nhiên
-    int num1 = random(100, 1000); // Số ngẫu nhiên 3 chữ số
-    int num2 = random(0, 100);    // Số ngẫu nhiên 2 chữ số
+      // Trigger Buzzer
+      digitalWrite(BUZZZER_PIN, HIGH);
+      delay(1000);
+      digitalWrite(BUZZZER_PIN, LOW);
 
-    // Định dạng chuỗi: "43A-230.42"
-    snprintf(myData.CarLicense, 10, "%d%c-%03d.%02d",
-              province,
-              series,
-              num1,
-              num2);
-// ------------------------------------------------
+      // Đặt giá trị để gửi
+      myData.id = boardId; // Sử dụng Board ID động của chúng ta
+      myData.status = random(2); // Ngẫu nhiên 0 hoặc 1 (Ví dụ: Trạng thái đậu xe)
 
-    myData.readingId = readingId++;
+      // --- Tạo biển số xe ngẫu nhiên (Ví dụ: Việt Nam) ---
+      int province = 43; // Mã tỉnh '43' (Ví dụ: Đà Nẵng)
+      char series = random('A', 'Z' + 1); // Chữ cái ngẫu nhiên
+      int num1 = random(100, 1000); // Số ngẫu nhiên 3 chữ số
+      int num2 = random(0, 100);    // Số ngẫu nhiên 2 chữ số
 
-    // Gửi dữ liệu
-    esp_err_t result = esp_now_send(peerAddress, (uint8_t *) &myData, sizeof(myData));
+      // Định dạng chuỗi: "43A-230.42"
+      snprintf(myData.CarLicense, 10, "%d%c-%03d.%02d",
+                province,
+                series,
+                num1,
+                num2);
+      // ------------------------------------------------
 
-    // In trạng thái gửi
-    Serial.print("Đang gửi dữ liệu (Reading ID: ");
-    Serial.print(myData.readingId);
-    Serial.print("): ");
-    Serial.println(result == ESP_OK ? "Đã gửi" : "Gửi thất bại");
+      myData.readingId = readingId++;
+
+      // Gửi dữ liệu
+      esp_err_t result = esp_now_send(peerAddress, (uint8_t *) &myData, sizeof(myData));
+
+      // In trạng thái gửi
+      Serial.print("Đang gửi dữ liệu (Reading ID: ");
+      Serial.print(myData.readingId);
+      Serial.print("): ");
+      Serial.println(result == ESP_OK ? "Đã gửi" : "Gửi thất bại");
+    }
   }
 
   // Phần nhận hoạt động hoàn toàn ở chế độ nền thông qua hàm gọi lại OnDataRecv.
+  
+  // --- HEARTBEAT LOGIC ---
+  static unsigned long lastHeartbeat = 0;
+  if (millis() - lastHeartbeat > 5000) {
+    lastHeartbeat = millis();
+    // Resend the last known data to keep the connection alive
+    // If myData hasn't been set yet, it defaults to 0 (Available) which is safe.
+    esp_err_t result = esp_now_send(peerAddress, (uint8_t *) &myData, sizeof(myData));
+    // Optional: Print heartbeat status to Serial for debugging
+    // Serial.println("Heartbeat sent");
+  }
 }
