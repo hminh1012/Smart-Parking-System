@@ -7,8 +7,96 @@
  */
 
 // --- Wi-Fi Credentials ---
-#define WIFI_SSID "Bubuchacha"
-#define WIFI_PASSWORD "umbalaxibua"
+// #define WIFI_SSID "Bubuchacha" // Removed for WiFi Manager
+// #define WIFI_PASSWORD "umbalaxibua"
+
+// --- Libraries ---
+#include <ESPAsyncWebServer.h>
+#include <AsyncTCP.h>
+#include "LittleFS.h"
+#include <lvgl.h>
+#include <TFT_eSPI.h>
+#include <XPT2046_Touchscreen.h>
+#include <esp_now.h>
+#include <image.h>
+#include <WiFi.h>
+#include <freertos/queue.h>
+#include <Firebase_ESP_Client.h>
+#include "addons/TokenHelper.h"
+#include "addons/RTDBHelper.h"
+
+// --- WiFi Manager Globals ---
+AsyncWebServer server(80);
+const char* PARAM_SSC = "ssid";
+const char* PARAM_PWD = "pass";
+const char* PARAM_IP = "ip";
+const char* PARAM_GW = "gateway";
+
+String wm_ssid;
+String wm_pass;
+String wm_ip;
+String wm_gateway;
+
+const char* ssidPath = "/ssid.txt";
+const char* passPath = "/pass.txt";
+const char* ipPath = "/ip.txt";
+const char* gatewayPath = "/gateway.txt";
+
+IPAddress localIP;
+IPAddress localGateway;
+IPAddress subnet(255, 255, 0, 0);
+
+bool inConfigMode = false;
+
+const char index_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <title>ESP Wi-Fi Manager</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="icon" href="data:,">
+  <style>
+    html { font-family: Arial, Helvetica, sans-serif; display: inline-block; text-align: center; }
+    h1 { font-size: 1.8rem; color: white; }
+    p { font-size: 1.4rem; }
+    .topnav { overflow: hidden; background-color: #0A1128; }
+    body { margin: 0; }
+    .content { padding: 5%; }
+    .card-grid { max-width: 800px; margin: 0 auto; display: grid; grid-gap: 2rem; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); }
+    .card { background-color: white; box-shadow: 2px 2px 12px 1px rgba(140,140,140,.5); }
+    .card-title { font-size: 1.2rem; font-weight: bold; color: #034078 }
+    input[type=submit] { border: none; color: #FEFCFB; background-color: #034078; padding: 15px 15px; text-align: center; text-decoration: none; display: inline-block; font-size: 16px; width: 100px; margin-right: 10px; border-radius: 4px; transition-duration: 0.4s; }
+    input[type=submit]:hover { background-color: #1282A2; }
+    input[type=text], input[type=number], select { width: 50%; padding: 12px 20px; margin: 18px; display: inline-block; border: 1px solid #ccc; border-radius: 4px; box-sizing: border-box; }
+    label { font-size: 1.2rem; }
+  </style>
+</head>
+<body>
+  <div class="topnav">
+    <h1>ESP Wi-Fi Manager</h1>
+  </div>
+  <div class="content">
+    <div class="card-grid">
+      <div class="card">
+        <form action="/" method="POST">
+          <p>
+            <label for="ssid">SSID</label>
+            <input type="text" id ="ssid" name="ssid"><br>
+            <label for="pass">Password</label>
+            <input type="text" id ="pass" name="pass"><br>
+            <label for="ip">IP Address</label>
+            <input type="text" id ="ip" name="ip" placeholder="Optional"><br>
+            <label for="gateway">Gateway Address</label>
+            <input type="text" id ="gateway" name="gateway" placeholder="Optional"><br>
+            <input type ="submit" value ="Submit">
+          </p>
+        </form>
+      </div>
+    </div>
+  </div>
+</body>
+</html>
+)rawliteral";
 
 // --- Firebase Project Credentials ---
 #define WEB_API_KEY "AIzaSyC58kY22AMwBzdzzOfp66BRBzOZG9Kl8xo"
@@ -35,16 +123,7 @@ const char* FB_STATUS_AVAILABLE = "available";
 const char* FB_LED_ON = "on";
 const char* FB_LED_OFF = "off";
 
-// --- Libraries ---
-#include <lvgl.h>
-#include <TFT_eSPI.h>
-#include <XPT2046_Touchscreen.h>
-#include <esp_now.h>
-#include <WiFi.h>
-#include <freertos/queue.h>
-#include <Firebase_ESP_Client.h>
-#include "addons/TokenHelper.h"
-#include "addons/RTDBHelper.h"
+
 
 // --- MAC Addresses ---
 uint8_t board_macs[MAX_BOARDS][6] = {
@@ -111,6 +190,128 @@ static lv_obj_t * led_buttons[MAX_BOARDS];
 static lv_obj_t * conn_table; 
 
 // ================= HELPERS =================
+
+// --- LittleFS Helpers ---
+void initLittleFS() {
+  if (!LittleFS.begin(true)) {
+    Serial.println("An error has occurred while mounting LittleFS");
+  }
+}
+
+String readFile(fs::FS &fs, const char * path){
+  File file = fs.open(path);
+  if(!file || file.isDirectory()) return String();
+  String fileContent;
+  while(file.available()){
+    fileContent = file.readStringUntil('\n'); // Reads one line
+    break;     
+  }
+  return fileContent;
+}
+
+void writeFile(fs::FS &fs, const char * path, const char * message){
+  File file = fs.open(path, FILE_WRITE);
+  if(file.print(message)) Serial.println("- file written");
+  else Serial.println("- write failed");
+}
+
+// --- WiFi Manager Logic ---
+bool initWiFiManager() {
+  wm_ssid = readFile(LittleFS, ssidPath);
+  wm_pass = readFile(LittleFS, passPath);
+  wm_ip = readFile(LittleFS, ipPath);
+  wm_gateway = readFile(LittleFS, gatewayPath);
+  
+  if(wm_ssid == ""){
+    Serial.println("Undefined SSID.");
+    return false;
+  }
+
+  WiFi.mode(WIFI_AP_STA); 
+  
+  if (wm_ip != "") {
+      localIP.fromString(wm_ip.c_str());
+      localGateway.fromString(wm_gateway.c_str());
+      if (!WiFi.config(localIP, localGateway, subnet)){
+        Serial.println("STA Failed to configure");
+      }
+  }
+
+  WiFi.begin(wm_ssid.c_str(), wm_pass.c_str());
+  Serial.println("Connecting to WiFi...");
+
+  unsigned long currentMillis = millis();
+  unsigned long previousMillis = currentMillis;
+  const long interval = 10000;
+
+  while(WiFi.status() != WL_CONNECTED) {
+    currentMillis = millis();
+    if (currentMillis - previousMillis >= interval) {
+      Serial.println("Failed to connect.");
+      return false;
+    }
+    delay(500); 
+    Serial.print(".");
+  }
+  Serial.println("\nConnected.");
+  Serial.println(WiFi.localIP());
+  return true;
+}
+
+void startConfigAP() {
+  if (inConfigMode) return;
+  inConfigMode = true;
+
+  lv_obj_clean(lv_screen_active());
+  lv_obj_t * img = lv_image_create(lv_screen_active());
+  lv_image_set_src(img, &my_image);
+  lv_obj_center(img);
+
+  lv_obj_t * label = lv_label_create(lv_screen_active());
+  lv_label_set_text(label, "WiFi Config Mode\n192.168.4.1");
+  lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);
+  lv_obj_align_to(label, img, LV_ALIGN_OUT_BOTTOM_MID, 0, 10);
+
+  Serial.println("Setting AP (Access Point)");
+  WiFi.softAP("SMART-PARKING-CONFIG", NULL);
+  
+  IPAddress IP = WiFi.softAPIP();
+  Serial.print("AP IP address: ");
+  Serial.println(IP); 
+
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
+      request->send(200, "text/html", index_html);
+  });
+  
+  server.on("/", HTTP_POST, [](AsyncWebServerRequest *request) {
+      int params = request->params();
+      for(int i=0;i<params;i++){
+        const AsyncWebParameter* p = request->getParam(i);
+        if(p->isPost()){
+          if (p->name() == PARAM_SSC) {
+            wm_ssid = p->value().c_str();
+            writeFile(LittleFS, ssidPath, wm_ssid.c_str());
+          }
+          if (p->name() == PARAM_PWD) {
+            wm_pass = p->value().c_str();
+            writeFile(LittleFS, passPath, wm_pass.c_str());
+          }
+          if (p->name() == PARAM_IP) {
+            wm_ip = p->value().c_str();
+            writeFile(LittleFS, ipPath, wm_ip.c_str());
+          }
+          if (p->name() == PARAM_GW) {
+            wm_gateway = p->value().c_str();
+            writeFile(LittleFS, gatewayPath, wm_gateway.c_str());
+          }
+        }
+      }
+      request->send(200, "text/plain", "Done. ESP will restart...");
+      delay(3000);
+      ESP.restart();
+  });
+  server.begin();
+}
 
 String getSpotPath(int board_id) {
   return String(FB_BASE_PATH) + "/A0" + String(board_id);
@@ -192,6 +393,13 @@ static void led_button_event_handler(lv_event_t * e) {
   }
 }
 
+static void event_wifi_config(lv_event_t * e) {
+    startConfigAP();
+    lv_obj_t * btn = (lv_obj_t *)lv_event_get_target(e);
+    lv_obj_t * label = lv_obj_get_child(btn, 0);
+    lv_label_set_text(label, "Config Mode Active!");
+}
+
 void update_table_values(int board_id, struct_message *myData) {
   int board_index = board_id - 1;
   if (board_index < 0 || board_index >= current_boards) return;
@@ -269,17 +477,44 @@ void lv_create_main_gui(void) {
     lv_table_set_cell_value(conn_table, i + 1, 1, getShortMac(board_macs[i]).c_str());
     lv_table_set_cell_value(conn_table, i + 1, 2, "Offline");
   }
+
+  lv_obj_t * tab_sys = lv_tabview_add_tab(tabview, "Sys");
+  lv_obj_t * btn_conf = lv_button_create(tab_sys);
+  lv_obj_set_size(btn_conf, 180, 50);
+  lv_obj_center(btn_conf);
+  lv_obj_add_event_cb(btn_conf, event_wifi_config, LV_EVENT_CLICKED, NULL);
+  lv_obj_t * label_conf = lv_label_create(btn_conf);
+  lv_label_set_text(label_conf, "Enter WiFi Config");
+  lv_obj_center(label_conf);
 }
 
 // ================= SETUP =================
+void initDisplay() {
+  lv_init();
+  lv_log_register_print_cb(log_print);
+  touchscreenSPI.begin(XPT2046_CLK, XPT2046_MISO, XPT2046_MOSI, XPT2046_CS);
+  touchscreen.begin(touchscreenSPI); touchscreen.setRotation(2);
+  lv_display_t * disp = lv_tft_espi_create(SCREEN_WIDTH, SCREEN_HEIGHT, draw_buf, sizeof(draw_buf));
+  lv_display_set_rotation(disp, LV_DISPLAY_ROTATION_270);
+  lv_indev_t * indev = lv_indev_create();
+  lv_indev_set_type(indev, LV_INDEV_TYPE_POINTER);
+  lv_indev_set_read_cb(indev, touchscreen_read);
+}
+
 void setup() {
   Serial.begin(115200);
   Serial.println("System Initializing...");
 
-  WiFi.mode(WIFI_AP_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  unsigned long startWifi = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - startWifi < 10000) { delay(100); }
+  initLittleFS();
+
+  initDisplay();
+
+
+  if (!initWiFiManager()) {
+    Serial.println("Starting Config AP...");
+    startConfigAP();
+    return; // Exit setup to avoid Firebase/GUI init crashes
+  }
 
   config.api_key = WEB_API_KEY; auth.user.email = USER_EMAIL; auth.user.password = USER_PASS;
   config.database_url = DATABASE_URL; config.token_status_callback = tokenStatusCallback;
@@ -324,15 +559,8 @@ void setup() {
   // --- Update Queue to hold Wrapper Struct ---
   esp_now_queue = xQueueCreate(10, sizeof(GatewayMessage)); 
 
-  lv_init();
-  lv_log_register_print_cb(log_print);
-  touchscreenSPI.begin(XPT2046_CLK, XPT2046_MISO, XPT2046_MOSI, XPT2046_CS);
-  touchscreen.begin(touchscreenSPI); touchscreen.setRotation(2);
-  lv_display_t * disp = lv_tft_espi_create(SCREEN_WIDTH, SCREEN_HEIGHT, draw_buf, sizeof(draw_buf));
-  lv_display_set_rotation(disp, LV_DISPLAY_ROTATION_270);
-  lv_indev_t * indev = lv_indev_create();
-  lv_indev_set_type(indev, LV_INDEV_TYPE_POINTER);
-  lv_indev_set_read_cb(indev, touchscreen_read);
+  // Display initialized early in setup
+
   
   lv_create_main_gui(); 
 
@@ -342,11 +570,9 @@ void setup() {
 }
 
 // ================= LOOP =================
-void loop() {
-  lv_task_handler(); lv_tick_inc(5); delay(5);
-
-  // --- HANDLE ESP-NOW DATA ---
-  GatewayMessage msg; // Use wrapper
+// ================= LOOP =================
+void handle_esp_now_incoming() {
+  GatewayMessage msg; 
   if (xQueueReceive(esp_now_queue, &msg, 0) == pdTRUE) {
     
     // 1. Identify Board by MAC
@@ -403,12 +629,13 @@ void loop() {
 
     } else {
       // Optional: Print ignored MACs for debugging
-      Serial.print("Ignored Unknown MAC: ");
-      Serial.println(formatMacAddress(msg.senderMac));
+      // Serial.print("Ignored Unknown MAC: ");
+      // Serial.println(formatMacAddress(msg.senderMac));
     }
   }
+}
 
-  // --- TIMEOUT CHECK ---
+void handle_timeout_check() {
   if (millis() - lastTimeoutCheck > CHECK_TIMEOUT_INTERVAL) {
     lastTimeoutCheck = millis();
     for (int i = 0; i < current_boards; i++) {
@@ -421,22 +648,46 @@ void loop() {
       }
     }
   }
+}
 
-  // --- FIREBASE READ ---
+void handle_firebase_sync() {
   if (millis() - lastReadMillis >= FIREBASE_READ_INTERVAL) {
     lastReadMillis = millis();
     if (Firebase.ready()) {
       for (int i = 0; i < current_boards; i++) readDataFromFirebase(i + 1);
     }
   }
+}
 
-  // --- BROADCAST BEACON ---
+void handle_beacon_broadcast() {
   static unsigned long lastBroadcast = 0;
-  if (millis() - lastBroadcast > 5000) {
+  if (millis() - lastBroadcast > 1000) { // Increased freq for faster discovery
     lastBroadcast = millis();
-    const char *beaconMsg = "DISCOVER_MASTER";
+    // Default to "Unknown" if wm_ssid is empty (though it shouldn't be here)
+    String ssidToSend = (wm_ssid.length() > 0) ? wm_ssid : "default"; 
+    String msg = "DISCOVER_MASTER:" + ssidToSend;
+    
     uint8_t broadcastAddress[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
-    esp_now_send(broadcastAddress, (uint8_t *)beaconMsg, strlen(beaconMsg) + 1);
-    Serial.println("Broadcasting discovery message...");
+    esp_now_send(broadcastAddress, (uint8_t *)msg.c_str(), msg.length() + 1);
   }
+}
+
+void loop() {
+  // 1. Maintain Display (Must be called frequently)
+  lv_task_handler(); 
+  lv_tick_inc(5);
+
+  if (inConfigMode) {
+    delay(5);
+    return; 
+  }
+
+  // 2. Handle Network Tasks
+  handle_esp_now_incoming();
+  handle_timeout_check();
+  handle_firebase_sync();
+  handle_beacon_broadcast();
+
+  // 3. Yield to system (Watchdog)
+  delay(5);
 }
