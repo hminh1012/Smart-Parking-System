@@ -18,7 +18,9 @@
 
 // --- CẤU HÌNH WIFI (QUAN TRỌNG) ---
 // Vui lòng thay thế bằng SSID Wi-Fi thực tế của bạn
-constexpr char WIFI_SSID[] = "Bubuchacha";
+String received_ssid = ""; // Dynamic SSID from Gateway
+unsigned long lastChannelScan = 0;
+
 
 // Hàm tìm kiếm kênh của SSID Wi-Fi (Cần thiết cho ESP-NOW)
 int32_t getWiFiChannel(const char *ssid) {
@@ -143,6 +145,21 @@ void OnDataRecv(const esp_now_recv_info *recv_info, const uint8_t *incomingDataB
         Serial.println("Failed to register Master.");
       }
     }
+    
+    // --- PARSE SSID FROM BROADCAST ---
+    // Msg format: "DISCOVER_MASTER:MySSID"
+    String msg = "";
+    for(int i=0; i<len; i++) msg += (char)incomingDataBytes[i];
+    
+    if (msg.startsWith("DISCOVER_MASTER:")) {
+       String extracted = msg.substring(16);
+       if (received_ssid == "") {
+          received_ssid = extracted;
+          Serial.println(">> SSID DISCOVERED: " + received_ssid);
+          Serial.printf(">> LOCKED CHANNEL: %d\n", WiFi.channel());
+       }
+    }
+    
     return; // Don't process broadcast as LED command
   }
   
@@ -205,17 +222,9 @@ void setup() {
   WiFi.mode(WIFI_STA);
   
   // --- LOGIC THIẾT LẬP KÊNH (Đã thêm) ---
-  int32_t channel = getWiFiChannel(WIFI_SSID);
-  if (channel != 0) {
-    Serial.printf("Tìm thấy kênh WiFi: %d\n", channel);
-    // Thiết lập kênh cho ESP32
-    esp_wifi_set_promiscuous(true);
-    esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
-    esp_wifi_set_promiscuous(false);
-  } else {
-    Serial.println("Cảnh báo: Không thể xác định kênh WiFi. Đang sử dụng kênh mặc định.");
-    channel = 0; // Đảm bảo kênh là 0 nếu không tìm thấy
-  }
+  // --- LOGIC THIẾT LẬP KÊNH ---
+  // Chúng ta sẽ quét kênh trong loop() nếu chưa có SSID
+  Serial.println("Đang đợi Broadcast DISCOVER_MASTER để lấy SSID...");
   // -------------------------------------
 
   // --- Xác định Board này ---
@@ -244,7 +253,7 @@ void setup() {
 
   // Đăng ký peer (board đối diện)
   memcpy(peerInfo.peer_addr, peerAddress, 6);
-  peerInfo.channel = channel; // Thiết lập kênh peer
+  peerInfo.channel = 0; // Thiết lập kênh peer (0 = channel hiện tại/chưa biết)
   peerInfo.encrypt = false;
 
   // Thêm peer
@@ -297,4 +306,16 @@ void loop() {
   }
 
   // Phần nhận hoạt động hoàn toàn ở chế độ nền thông qua hàm gọi lại OnDataRecv.
+
+  // --- CHANNEL SCANNING ---
+  if (received_ssid == "") {
+    if (millis() - lastChannelScan > 200) {
+      lastChannelScan = millis();
+      int newCh = (WiFi.channel() % 13) + 1;
+      esp_wifi_set_promiscuous(true);
+      esp_wifi_set_channel(newCh, WIFI_SECOND_CHAN_NONE);
+      esp_wifi_set_promiscuous(false);
+      // Serial.printf("Scanning Ch: %d\n", newCh); 
+    }
+  }
 }
