@@ -1,5 +1,6 @@
 #include "esp_camera.h"
 #include <WiFi.h>
+#include <HTTPClient.h>
 #include <vector>
 #include <finalProject_inferencing.h>
 #include <cmath>
@@ -11,8 +12,13 @@ using std::queue;
 #include <utility>
 #include <climits>  // For INT_MAX
 #include <algorithm>  // For std::min, std::max
-#include "board_config.h"
-String recognizedText;
+
+// ===================== Include file ảnh đã tạo =====================
+#include "input_image.h"
+
+
+uint8_t* jpg_buf = NULL;
+size_t jpg_buf_len = 0;
 
 // ===================== BIẾN TOÀN CỤC CHO XỬ LÝ BIỂN SỐ =====================
 int plateStartX = 0, plateStartY = 0, plateEndX = 0, plateEndY = 0;
@@ -46,6 +52,11 @@ struct Rect {
     int minX, minY, maxX, maxY;
 };
 
+// Struct để trả về kết quả phát hiện viền đen
+struct BlackEdgeResult {
+    int firstPos;
+    int count;
+};
 // ===================== KHAI BÁO HÀM =====================
 std::pair<int, int> findCharacterVerticalBounds(int startX, int endX);
 bool resizeCharacterTo28x28_Nearest(int startX, int endX, ResizedCharacter& result);
@@ -53,7 +64,12 @@ PredictionResult predictCharacterFromImage(uint8_t* image_data, int img_width, i
 PredictionResult predictResizedCharacter(const ResizedCharacter& character);
 String recognizeCharactersFromPlate();
 std::vector<std::pair<int, int>> filterCharactersBySize(const std::vector<std::pair<int, int>>& characters);
-String extractJsonValue(const String& json, const String& key);
+void findContour(uint8_t* edge, uint8_t* visited, int w, int h,
+                 int startX, int startY, vector<Point>& contour);
+
+float calculateContourArea(const vector<Point>& contour);
+
+Rect boundingRect(const vector<Point>& points);
 
 // ===================== HÀM XỬ LÝ BIỂN SỐ =====================
 
@@ -458,8 +474,8 @@ void analyzeRegionHistogram(int startX, int endX, int startY, int endY, const ch
 void advancedBlackBorderRemoval() {
     Serial.println("\n=== QUÉT VIỀN ĐEN NÂNG CAO ===");
     
-    const float BLACK_THRESHOLD_LOW = 0.3f;   // Ngưỡng thấp: 20%
-    const float BLACK_THRESHOLD_HIGH = 0.5f;  // Ngưỡng cao: 40%
+    const float BLACK_THRESHOLD_LOW = 0.6f;   // Ngưỡng thấp: 20%
+    const float BLACK_THRESHOLD_HIGH = 0.7f;  // Ngưỡng cao: 40%
     const int SCAN_DEPTH = 40; // Quét sâu hơn: 40 pixel
     const int MIN_BLACK_STREAK = 3; // Yêu cầu ít nhất 3 hàng đen liên tiếp
 
@@ -613,7 +629,7 @@ void advancedBlackBorderRemoval() {
 void deepCropBorder() {
     Serial.println("\n=== XÓA VIỀN SÂU NÂNG CAO ===");
     
-    const int CONFIDENCE_SIDES = 80;
+    const int CONFIDENCE_SIDES = 85;
     const int CONFIDENCE_TOP_BOTTOM = 90;
     const int SCAN_STEP = 1;
     const int EXPAND_MARGIN = 2;
@@ -823,7 +839,6 @@ void displayCharacter(int charNum, int startX, int endX) {
     Serial.printf("└%*s┘\n", width + 2, "");
 }
 
-
 void processLicensePlate() {
     // PHÂN TÍCH NÂNG CAO
     calculateAutoThreshold();
@@ -848,7 +863,7 @@ void processLicensePlate() {
     }
 
     // ===================== NHẬN DẠNG KÝ TỰ BẰNG AI =====================
-    recognizedText = recognizeCharactersFromPlate();
+    String recognizedText = recognizeCharactersFromPlate();
     Serial.printf("\n🎯 BIỂN SỐ NHẬN DẠNG: %s\n", recognizedText.c_str());
 }
 
@@ -924,6 +939,14 @@ uint8_t* convertToGrayscale(const uint8_t* rgb, int width, int height) {
     return gray;
 }
 
+
+// Helper function to clamp values
+int clamp(int value, int min_val, int max_val) {
+    if (value < min_val) return min_val;
+    if (value > max_val) return max_val;
+    return value;
+}
+
 Rect boundingRect(const std::vector<Point>& points) {
     if (points.empty()) {
         return {0, 0, -1, -1};  // Invalid rect if no points
@@ -936,6 +959,85 @@ Rect boundingRect(const std::vector<Point>& points) {
         if (p.y > rect.maxY) rect.maxY = p.y;
     }
     return rect;
+}
+void refinePlate(uint8_t *gray, int w, int h, int &minX, int &minY, int &maxX, int &maxY, int expand = 15) {
+    // Mở rộng vùng ước lượng
+    int expandedMinX = max_val(0, minX - expand);
+    int expandedMinY = max_val(0, minY - expand);
+    int expandedMaxX = min_val(w-1, maxX + expand);
+    int expandedMaxY = min_val(h-1, maxY + expand);
+
+    // Ngưỡng trắng: có thể điều chỉnh
+    const uint8_t whiteThreshold = 200;
+    const float whiteRatioThreshold = 0.8f; // 80% pixel trong hàng/cột phải là trắng
+
+    // Tìm biên trái: quét từ trái sang
+    for (int x = expandedMinX; x <= expandedMaxX; x++) {
+        int whiteCount = 0;
+        int total = 0;
+        for (int y = expandedMinY; y <= expandedMaxY; y++) {
+            if (gray[y * w + x] >= whiteThreshold) {
+                whiteCount++;
+            }
+            total++;
+        }
+        float ratio = (float)whiteCount / total;
+        if (ratio >= whiteRatioThreshold) {
+            minX = x;
+            break;
+        }
+    }
+
+    // Tìm biên phải: quét từ phải sang trái
+    for (int x = expandedMaxX; x >= expandedMinX; x--) {
+        int whiteCount = 0;
+        int total = 0;
+        for (int y = expandedMinY; y <= expandedMaxY; y++) {
+            if (gray[y * w + x] >= whiteThreshold) {
+                whiteCount++;
+            }
+            total++;
+        }
+        float ratio = (float)whiteCount / total;
+        if (ratio >= whiteRatioThreshold) {
+            maxX = x;
+            break;
+        }
+    }
+
+    // Tìm biên trên: quét từ trên xuống
+    for (int y = expandedMinY; y <= expandedMaxY; y++) {
+        int whiteCount = 0;
+        int total = 0;
+        for (int x = expandedMinX; x <= expandedMaxX; x++) {
+            if (gray[y * w + x] >= whiteThreshold) {
+                whiteCount++;
+            }
+            total++;
+        }
+        float ratio = (float)whiteCount / total;
+        if (ratio >= whiteRatioThreshold) {
+            minY = y;
+            break;
+        }
+    }
+
+    // Tìm biên dưới: quét từ dưới lên
+    for (int y = expandedMaxY; y >= expandedMinY; y--) {
+        int whiteCount = 0;
+        int total = 0;
+        for (int x = expandedMinX; x <= expandedMaxX; x++) {
+            if (gray[y * w + x] >= whiteThreshold) {
+                whiteCount++;
+            }
+            total++;
+        }
+        float ratio = (float)whiteCount / total;
+        if (ratio >= whiteRatioThreshold) {
+            maxY = y;
+            break;
+        }
+    }
 }
 
 // ===================== Optimized Detect License Plate =====================
@@ -1316,183 +1418,52 @@ void detectPlate(uint8_t *gray, int w, int h, int &minX, int &minY, int &maxX, i
 
 void setup() {
     Serial.begin(115200);
-    Serial.setDebugOutput(true);
-    Serial.println();
-
-    // ===========================
-    // CẤU HÌNH CAMERA
-    // ===========================
-    camera_config_t config;
-    config.ledc_channel = LEDC_CHANNEL_0;
-    config.ledc_timer = LEDC_TIMER_0;
-    config.pin_d0 = Y2_GPIO_NUM;
-    config.pin_d1 = Y3_GPIO_NUM;
-    config.pin_d2 = Y4_GPIO_NUM;
-    config.pin_d3 = Y5_GPIO_NUM;
-    config.pin_d4 = Y6_GPIO_NUM;
-    config.pin_d5 = Y7_GPIO_NUM;
-    config.pin_d6 = Y8_GPIO_NUM;
-    config.pin_d7 = Y9_GPIO_NUM;
-    config.pin_xclk = XCLK_GPIO_NUM;
-    config.pin_pclk = PCLK_GPIO_NUM;
-    config.pin_vsync = VSYNC_GPIO_NUM;
-    config.pin_href = HREF_GPIO_NUM;
-    config.pin_sccb_sda = SIOD_GPIO_NUM;
-    config.pin_sccb_scl = SIOC_GPIO_NUM;
-    config.pin_pwdn = PWDN_GPIO_NUM;
-    config.pin_reset = RESET_GPIO_NUM;
-    config.xclk_freq_hz = 20000000;
-    config.frame_size = FRAMESIZE_UXGA;
-    config.pixel_format = PIXFORMAT_JPEG;
-    config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
-    config.fb_location = CAMERA_FB_IN_PSRAM;
-    config.jpeg_quality = 12;
-    config.fb_count = 1;
-
-    // Tối ưu hóa khi có PSRAM
-    if (config.pixel_format == PIXFORMAT_JPEG) {
-        if (psramFound()) {
-            config.jpeg_quality = 10;
-            config.fb_count = 2;
-            config.grab_mode = CAMERA_GRAB_LATEST;
-        } else {
-            config.frame_size = FRAMESIZE_SVGA;
-            config.fb_location = CAMERA_FB_IN_DRAM;
-        }
-    } else {
-        config.frame_size = FRAMESIZE_240X240;
-    #if CONFIG_IDF_TARGET_ESP32S3
-        config.fb_count = 2;
-    #endif
-    }
-
-    #if defined(CAMERA_MODEL_ESP_EYE)
-        pinMode(13, INPUT_PULLUP);
-        pinMode(14, INPUT_PULLUP);
-    #endif
-
-    // Khởi tạo camera
-    esp_err_t err = esp_camera_init(&config);
-    if (err != ESP_OK) {
-        Serial.printf("Camera init failed with error 0x%x", err);
-        return;
-    }
-
-    // Điều chỉnh sensor
-    sensor_t *s = esp_camera_sensor_get();
-    if (s) {
-        if (s->id.PID == OV3660_PID) {
-            s->set_vflip(s, 1);
-            s->set_brightness(s, 1);
-            s->set_saturation(s, -2);
-        }
-        
-        // Giảm độ phân giải để tăng frame rate ban đầu
-        if (config.pixel_format == PIXFORMAT_JPEG) {
-            s->set_framesize(s, FRAMESIZE_VGA);
-        }
-    }
-
-    #if defined(CAMERA_MODEL_M5STACK_WIDE) || defined(CAMERA_MODEL_M5STACK_ESP32CAM)
-        s->set_vflip(s, 1);
-        s->set_hmirror(s, 1);
-    #endif
-
-    #if defined(CAMERA_MODEL_ESP32S3_EYE)
-        s->set_vflip(s, 1);
-    #endif
-
-    Serial.println("✅ Camera initialized");
-    delay(2000);
 }
 
 void loop() {
     static unsigned long last = 0;
+    static int current_image = 0;
     
     if (millis() - last < 5000) return;
     last = millis();
 
-    Serial.println("\n📸 Capturing image...");
-  
-    // Lấy frame từ camera
-    camera_fb_t *fb = esp_camera_fb_get();
-    
-    if (!fb) {
-        Serial.println("❌ Camera capture failed");
-        return;
-    }
-
-    Serial.printf("✅ Captured image - Size: %d bytes, Width: %d, Height: %d\n", 
-                  fb->len, fb->width, fb->height);
-
-    // LƯU TRỮ THÔNG TIN TRƯỚC KHI GIẢI PHÓNG
-    int w = fb->width;
-    int h = fb->height;
-    size_t jpeg_len = fb->len;
-    uint8_t* jpeg_data = (uint8_t*)malloc(jpeg_len);
-    
-    if (!jpeg_data) {
-        Serial.println("❌ Failed to allocate memory for jpeg data");
-        esp_camera_fb_return(fb);
-        return;
-    }
-    
-    memcpy(jpeg_data, fb->buf, jpeg_len);  // Sao chép dữ liệu
-    esp_camera_fb_return(fb);  // Giải phóng frame buffer sớm
+    // THAY THẾ PHẦN NÀY BẰNG CODE CHỤP ẢNH THỰC TẾ
+    const uint8_t* jpeg_data = img_jpeg_0;
+    size_t jpeg_len = img_jpeg_0_len;
+    int w = img_jpeg_0_width;
+    int h = img_jpeg_0_height;
 
     Serial.printf("🖼️ Processing image, size: %d bytes, dimensions: %dx%d\n", jpeg_len, w, h);
 
     size_t pixels = (size_t)w * h;
-    uint8_t *rgb = (uint8_t*)malloc(pixels * 3);
-    
+    uint8_t *rgb = (uint8_t*) malloc(pixels * 3);
     if (!rgb) {
         Serial.println("❌ malloc rgb failed");
-        free(jpeg_data);
         return;
     }
 
-    // Chuyển đổi JPEG sang RGB
     bool converted = fmt2rgb888(jpeg_data, jpeg_len, PIXFORMAT_JPEG, rgb);
-    free(jpeg_data);  // Giải phóng dữ liệu JPEG đã sao chép
-    
     if (!converted) {
         Serial.println("❌ JPEG to RGB conversion failed");
         free(rgb);
         return;
     }
-    
-    // Chuyển BGR sang RGB
-    for (size_t i = 0; i < pixels; i++) {
-        uint8_t tmp = rgb[3 * i];
-        rgb[3 * i] = rgb[3 * i + 2];
-        rgb[3 * i + 2] = tmp;
-    }
 
-    // Chuyển sang grayscale
-    uint8_t *gray = (uint8_t*)malloc(pixels);
-    if (!gray) { 
-        free(rgb); 
-        return; 
-    }
-    
+    bgr2rgb(rgb, pixels);
+
+    uint8_t *gray = (uint8_t*) malloc(pixels);
+    if (!gray) { free(rgb); return; }
     for (size_t i = 0; i < pixels; i++) {
         uint8_t r = rgb[i * 3], g = rgb[i * 3 + 1], b = rgb[i * 3 + 2];
         gray[i] = (uint8_t)((r * 30 + g * 59 + b * 11) / 100);
     }
 
-    // Phát hiện biển số
     int minX, minY, maxX, maxY;
     detectPlate(gray, w, h, minX, minY, maxX, maxY);
-    Serial.printf("📦 Detected Region: x=%d, y=%d, w=%d, h=%d\n", 
-                  minX, minY, maxX - minX, maxY - minY);
+    Serial.printf("📦 Detected Region: x=%d, y=%d, w=%d, h=%d\n", minX, minY, maxX - minX, maxY - minY);
 
-    // Cắt biển số
     int cropWidth, cropHeight;
     uint8_t* croppedRGB = cropLicensePlate(rgb, w, h, minX, minY, maxX, maxY, &cropWidth, &cropHeight);
-    
-    // Giải phóng bộ nhớ
-    free(rgb);
-    free(gray);
     
     if (croppedRGB) {
         Serial.println("\n🎯 BẮT ĐẦU XỬ LÝ BIỂN SỐ VÀ PHÂN TÁCH KÝ TỰ");
@@ -1502,9 +1473,7 @@ void loop() {
             plate_gray_image = nullptr;
         }
         
-        // Chuyển sang grayscale để xử lý
         plate_gray_image = convertToGrayscale(croppedRGB, cropWidth, cropHeight);
-        free(croppedRGB);  // Giải phóng ảnh màu
         
         if (plate_gray_image) {
             IMG_WIDTH = cropWidth;
@@ -1513,15 +1482,17 @@ void loop() {
             plateStartX = 0; plateStartY = 0;
             plateEndX = IMG_WIDTH-1; plateEndY = IMG_HEIGHT-1;
             
-            // Xử lý và nhận dạng biển số
             processLicensePlate();
             
-            // Giải phóng bộ nhớ
             free(plate_gray_image);
             plate_gray_image = nullptr;
         }
     }
 
+    free(rgb);
+    free(gray);
+
     Serial.println("✅ Done processing!\n");
-    delay(5000);
+    delay(10000);
 }
+

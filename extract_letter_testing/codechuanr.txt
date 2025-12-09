@@ -1,0 +1,401 @@
+#include "input_image.h"
+#include <vector>
+
+uint8_t* psram_img = nullptr;
+int plateStartX = 0, plateStartY = 0, plateEndX = IMG_WIDTH-1, plateEndY = IMG_HEIGHT-1;
+
+void setup() {
+    Serial.begin(115200);
+    
+    if(psramFound()){
+        psram_img = (uint8_t*)ps_malloc(IMG_WIDTH * IMG_HEIGHT);
+        if(psram_img) {
+            memcpy_P(psram_img, input_img, IMG_WIDTH * IMG_HEIGHT);
+            Serial.println("Image loaded to PSRAM");
+            
+            processLicensePlate();
+        }
+    }
+}
+
+uint8_t getPixel(int x, int y) {
+    if(x < 0 || x >= IMG_WIDTH || y < 0 || y >= IMG_HEIGHT) return 0;
+    return psram_img[y * IMG_WIDTH + x];
+}
+
+bool isBlackPixel(int x, int y) {
+    return getPixel(x, y) < 97;
+}
+
+bool isWhitePixel(int x, int y) {
+    return getPixel(x, y) > 101;
+}
+
+// =============================================
+// CẢI TIẾN 1: TÌM NGƯỠNG TỰ ĐỘNG
+// =============================================
+void calculateAutoThreshold() {
+    Serial.println("\n=== TÍNH NGƯỠNG TỰ ĐỘNG ===");
+    
+    int cornerSamples[8] = {
+        getPixel(0, 0), getPixel(IMG_WIDTH-1, 0),
+        getPixel(0, IMG_HEIGHT-1), getPixel(IMG_WIDTH-1, IMG_HEIGHT-1),
+        getPixel(10, 10), getPixel(IMG_WIDTH-11, 10),
+        getPixel(10, IMG_HEIGHT-11), getPixel(IMG_WIDTH-11, IMG_HEIGHT-11)
+    };
+    
+    int borderAvg = 0;
+    for(int i = 0; i < 8; i++) borderAvg += cornerSamples[i];
+    borderAvg /= 8;
+    
+    int centerX = IMG_WIDTH / 2, centerY = IMG_HEIGHT / 2;
+    int centerSamples[9];
+    for(int i = -1; i <= 1; i++) {
+        for(int j = -1; j <= 1; j++) {
+            centerSamples[(i+1)*3 + (j+1)] = getPixel(centerX + i, centerY + j);
+        }
+    }
+    
+    int centerAvg = 0;
+    for(int i = 0; i < 9; i++) centerAvg += centerSamples[i];
+    centerAvg /= 9;
+    
+    Serial.printf("→ Giá trị trung bình viền: %d\n", borderAvg);
+    Serial.printf("→ Giá trị trung bình trung tâm: %d\n", centerAvg);
+    Serial.printf("→ Độ chênh lệch: %d\n", abs(centerAvg - borderAvg));
+}
+
+// =============================================
+// CẢI TIẾN 2: PHÂN TÍCH HISTOGRAM THEO VÙNG
+// =============================================
+void analyzeRegionHistogram(int startX, int endX, int startY, int endY, const char* regionName) {
+    Serial.printf("\n=== PHÂN TÍCH HISTOGRAM %s ===\n", regionName);
+    
+    int histogram[256] = {0};
+    int totalPixels = (endX - startX + 1) * (endY - startY + 1);
+    
+    for(int y = startY; y <= endY; y++) {
+        for(int x = startX; x <= endX; x++) {
+            histogram[getPixel(x, y)]++;
+        }
+    }
+    
+    int maxCount = 0, peakValue = 0;
+    for(int i = 0; i < 256; i++) {
+        if(histogram[i] > maxCount) {
+            maxCount = histogram[i];
+            peakValue = i;
+        }
+    }
+    
+    Serial.printf("→ Peak: giá trị %d (xuất hiện %d lần, chiếm %.1f%%)\n", 
+                 peakValue, maxCount, (maxCount * 100.0) / totalPixels);
+}
+
+// =============================================
+// CẢI TIẾN 3: XÓA VIỀN SÂU (CẢ LỚP TRONG)
+// =============================================
+void deepCropBorder() {
+    Serial.println("\n=== XÓA VIỀN SÂU (CẢ LỚP TRONG) ===");
+    
+    const int REQUIRED_CONFIDENCE = 70;
+    const int SCAN_STEP = 1;
+    const int EXPAND_MARGIN = 4;
+    
+    // VIỀN TRÁI - XÓA SÂU
+    Serial.println("\n1. XÓA SÂU VIỀN TRÁI:");
+    plateStartX = 0;
+    for(int x = 0; x < IMG_WIDTH; x += SCAN_STEP) {
+        int whiteCount = 0;
+        int sampledPixels = 0;
+        
+        for(int y = 0; y < IMG_HEIGHT; y += 1) {
+            if(isWhitePixel(x, y)) whiteCount++;
+            sampledPixels++;
+        }
+        
+        float whiteRatio = (whiteCount * 100.0) / sampledPixels;
+        
+        if(whiteRatio >= REQUIRED_CONFIDENCE) {
+            bool confirmed = true;
+            for(int dx = x + 1; dx <= min(IMG_WIDTH-1, x + 5); dx++) {
+                int nextWhiteCount = 0;
+                for(int y = 0; y < IMG_HEIGHT; y += 2) {
+                    if(isWhitePixel(dx, y)) nextWhiteCount++;
+                }
+                float nextRatio = (nextWhiteCount * 100.0) / (IMG_HEIGHT / 2);
+                if(nextRatio < 60) {
+                    confirmed = false;
+                    break;
+                }
+            }
+            
+            if(confirmed) {
+                plateStartX = min(IMG_WIDTH-1, x + EXPAND_MARGIN);
+                Serial.printf("   → Biên trái sâu tại X=%d (tỷ lệ trắng: %.1f%%)\n", 
+                             plateStartX, whiteRatio);
+                Serial.printf("   → Đã xóa %d cột viền (bao gồm lớp trong)\n", plateStartX);
+                break;
+            }
+        }
+    }
+    
+    // VIỀN PHẢI - XÓA SÂU  
+    Serial.println("\n2. XÓA SÂU VIỀN PHẢI:");
+    plateEndX = IMG_WIDTH - 1;
+    for(int x = IMG_WIDTH - 1; x >= 0; x -= SCAN_STEP) {
+        int whiteCount = 0;
+        int sampledPixels = 0;
+        
+        for(int y = 0; y < IMG_HEIGHT; y += 1) {
+            if(isWhitePixel(x, y)) whiteCount++;
+            sampledPixels++;
+        }
+        
+        float whiteRatio = (whiteCount * 100.0) / sampledPixels;
+        
+        if(whiteRatio >= REQUIRED_CONFIDENCE) {
+            bool confirmed = true;
+            for(int dx = x - 1; dx >= max(0, x - 5); dx--) {
+                int nextWhiteCount = 0;
+                for(int y = 0; y < IMG_HEIGHT; y += 2) {
+                    if(isWhitePixel(dx, y)) nextWhiteCount++;
+                }
+                float nextRatio = (nextWhiteCount * 100.0) / (IMG_HEIGHT / 2);
+                if(nextRatio < 60) {
+                    confirmed = false;
+                    break;
+                }
+            }
+            
+            if(confirmed) {
+                plateEndX = max(0, x - EXPAND_MARGIN);
+                Serial.printf("   → Biên phải sâu tại X=%d (tỷ lệ trắng: %.1f%%)\n", 
+                             plateEndX, whiteRatio);
+                Serial.printf("   → Đã xóa %d cột viền\n", IMG_WIDTH - 1 - plateEndX);
+                break;
+            }
+        }
+    }
+    
+    // VIỀN TRÊN - XÓA SÂU
+    Serial.println("\n3. XÓA SÂU VIỀN TRÊN:");
+    plateStartY = 0;
+    for(int y = 0; y < IMG_HEIGHT; y += SCAN_STEP) {
+        int whiteCount = 0;
+        int sampledPixels = 0;
+        
+        for(int x = plateStartX; x <= plateEndX; x += 1) {
+            if(isWhitePixel(x, y)) whiteCount++;
+            sampledPixels++;
+        }
+        
+        float whiteRatio = (whiteCount * 100.0) / sampledPixels;
+        
+        if(whiteRatio >= REQUIRED_CONFIDENCE) {
+            bool confirmed = true;
+            for(int dy = y + 1; dy <= min(IMG_HEIGHT-1, y + 5); dy++) {
+                int nextWhiteCount = 0;
+                for(int x = plateStartX; x <= plateEndX; x += 2) {
+                    if(isWhitePixel(x, dy)) nextWhiteCount++;
+                }
+                float nextRatio = (nextWhiteCount * 100.0) / ((plateEndX - plateStartX + 1) / 2);
+                if(nextRatio < 60) {
+                    confirmed = false;
+                    break;
+                }
+            }
+            
+            if(confirmed) {
+                plateStartY = min(IMG_HEIGHT-1, y + EXPAND_MARGIN);
+                Serial.printf("   → Biên trên sâu tại Y=%d (tỷ lệ trắng: %.1f%%)\n", 
+                             plateStartY, whiteRatio);
+                Serial.printf("   → Đã xóa %d hàng viền\n", plateStartY);
+                break;
+            }
+        }
+    }
+    
+    // VIỀN DƯỚI - XÓA SÂU
+    Serial.println("\n4. XÓA SÂU VIỀN DƯỚI:");
+    plateEndY = IMG_HEIGHT - 1;
+    for(int y = IMG_HEIGHT - 1; y >= 0; y -= SCAN_STEP) {
+        int whiteCount = 0;
+        int sampledPixels = 0;
+        
+        for(int x = plateStartX; x <= plateEndX; x += 1) {
+            if(isWhitePixel(x, y)) whiteCount++;
+            sampledPixels++;
+        }
+        
+        float whiteRatio = (whiteCount * 100.0) / sampledPixels;
+        
+        if(whiteRatio >= REQUIRED_CONFIDENCE) {
+            bool confirmed = true;
+            for(int dy = y - 1; dy >= max(0, y - 5); dy--) {
+                int nextWhiteCount = 0;
+                for(int x = plateStartX; x <= plateEndX; x += 2) {
+                    if(isWhitePixel(x, dy)) nextWhiteCount++;
+                }
+                float nextRatio = (nextWhiteCount * 100.0) / ((plateEndX - plateStartX + 1) / 2);
+                if(nextRatio < 60) {
+                    confirmed = false;
+                    break;
+                }
+            }
+            
+            if(confirmed) {
+                plateEndY = max(0, y - EXPAND_MARGIN);
+                Serial.printf("   → Biên dưới sâu tại Y=%d (tỷ lệ trắng: %.1f%%)\n", 
+                             plateEndY, whiteRatio);
+                Serial.printf("   → Đã xóa %d hàng viền\n", IMG_HEIGHT - 1 - plateEndY);
+                break;
+            }
+        }
+    }
+    
+    // KIỂM TRA TÍNH HỢP LỆ
+    bool isValidCrop = (plateEndX - plateStartX > 50) && (plateEndY - plateStartY > 20);
+    
+    Serial.println("\n=== KẾT QUẢ XÓA VIỀN SÂU ===");
+    Serial.printf("Vùng biển số SẠCH: X[%d-%d] Y[%d-%d]\n", 
+                 plateStartX, plateEndX, plateStartY, plateEndY);
+    Serial.printf("Kích thước thực: %d × %d pixel\n", 
+                 plateEndX-plateStartX+1, plateEndY-plateStartY+1);
+    Serial.printf("Tính hợp lệ: %s\n", isValidCrop ? "HỢP LỆ" : "CÓ VẤN ĐỀ");
+    
+    if(!isValidCrop) {
+        Serial.println("⚠️  Cảnh báo: Vùng crop có vẻ không hợp lệ!");
+        Serial.println("   → Khôi phục kích thước gốc");
+        plateStartX = 0; plateStartY = 0;
+        plateEndX = IMG_WIDTH-1; plateEndY = IMG_HEIGHT-1;
+    }
+}
+
+// =============================================
+// CÁC HÀM HELPER
+// =============================================
+int min(int a, int b) { return (a < b) ? a : b; }
+int max(int a, int b) { return (a > b) ? a : b; }
+
+// =============================================
+// PHÂN TÁCH KÝ TỰ
+// =============================================
+std::vector<std::pair<int, int>> findCharactersByRelativeWhiteGaps() {
+    std::vector<std::pair<int, int>> characters;
+    
+    std::vector<int> blackDensity;
+    for(int x = plateStartX; x <= plateEndX; x++) {
+        int blackCount = 0;
+        for(int y = plateStartY; y <= plateEndY; y++) {
+            if(isBlackPixel(x, y)) blackCount++;
+        }
+        blackDensity.push_back(blackCount);
+    }
+    
+    const int LOW_DENSITY_THRESHOLD = 3;
+    const int MIN_GAP_WIDTH = 2;
+    
+    std::vector<std::pair<int, int>> gapRegions;
+    int gapStart = -1;
+    
+    for(int i = 0; i < blackDensity.size(); i++) {
+        int x = plateStartX + i;
+        if(blackDensity[i] <= LOW_DENSITY_THRESHOLD) {
+            if(gapStart == -1) gapStart = x;
+        } else {
+            if(gapStart != -1) {
+                int gapEnd = x - 1;
+                if(gapEnd - gapStart + 1 >= MIN_GAP_WIDTH) {
+                    gapRegions.push_back({gapStart, gapEnd});
+                }
+                gapStart = -1;
+            }
+        }
+    }
+    
+    // Xử lý gap cuối cùng
+    if(gapStart != -1) {
+        int gapEnd = plateEndX;
+        if(gapEnd - gapStart + 1 >= MIN_GAP_WIDTH) {
+            gapRegions.push_back({gapStart, gapEnd});
+        }
+    }
+    
+    // Phân đoạn ký tự
+    if(gapRegions.empty()) {
+        characters.push_back({plateStartX, plateEndX});
+    } else {
+        if(gapRegions[0].first > plateStartX) {
+            characters.push_back({plateStartX, gapRegions[0].first - 1});
+        }
+        for(int i = 0; i < gapRegions.size() - 1; i++) {
+            int charStart = gapRegions[i].second + 1;
+            int charEnd = gapRegions[i+1].first - 1;
+            if(charEnd >= charStart) {
+                characters.push_back({charStart, charEnd});
+            }
+        }
+        if(gapRegions.back().second < plateEndX) {
+            characters.push_back({gapRegions.back().second + 1, plateEndX});
+        }
+    }
+    
+    Serial.printf("→ Phát hiện %d ký tự\n", characters.size());
+    return characters;
+}
+
+void displayCroppedPlate() {
+    Serial.println("\n=== BIỂN SỐ SAU KHI XÓA VIỀN ===");
+    
+    for(int y = plateStartY; y <= plateEndY; y++) {
+        for(int x = plateStartX; x <= plateEndX; x++) {
+            Serial.print(isBlackPixel(x, y) ? "#" : ".");
+        }
+        Serial.println();
+    }
+}
+
+void displayCharacter(int charNum, int startX, int endX) {
+    int width = endX - startX + 1;
+    
+    Serial.printf("\n┌── KÝ TỰ %d (Rộng: %d pixel) ──┐\n", charNum, width);
+    
+    for(int y = plateStartY; y <= plateEndY; y++) {
+        Serial.print("│ ");
+        for(int x = startX; x <= endX; x++) {
+            Serial.print(isBlackPixel(x, y) ? "█" : " ");
+        }
+        Serial.println(" │");
+    }
+    Serial.printf("└%*s┘\n", width + 2, "");
+}
+
+void processLicensePlate() {
+    // PHÂN TÍCH NÂNG CAO
+    calculateAutoThreshold();
+    analyzeRegionHistogram(0, IMG_WIDTH-1, 0, IMG_HEIGHT-1, "TOÀN ẢNH");
+    
+    // XÓA VIỀN SÂU
+    deepCropBorder();
+    
+    // PHÂN TÍCH VÙNG ĐÃ CROP
+    analyzeRegionHistogram(plateStartX, plateEndX, plateStartY, plateEndY, "SAU CROP");
+    
+    // HIỂN THỊ VÀ PHÂN TÁCH
+    displayCroppedPlate();
+    
+    std::vector<std::pair<int, int>> characters = findCharactersByRelativeWhiteGaps();
+    
+    Serial.printf("\n=== KẾT QUẢ: %d KÝ TỰ ===\n", characters.size());
+    
+    for(int i = 0; i < characters.size(); i++) {
+        displayCharacter(i + 1, characters[i].first, characters[i].second);
+    }
+}
+
+void loop() {
+    delay(30000);
+    Serial.println("\n\n=== XỬ LÝ LẠI ===");
+    processLicensePlate();
+}
