@@ -53,12 +53,13 @@ unsigned int readingId = 0;
 bool master_found = false;
 
 
-// ===================== WiFi Config =====================
-const char* ssid = "BZz";
-const char* password = "123456789";
-String serverName = "buu.pythonanywhere.com";
-String serverPath = "/upload_plate";
-const int serverPort = 80;
+// ===================== WiFi Config (Dynamic) =====================
+String received_ssid = ""; 
+bool master_found = false;
+int current_channel = 1;
+unsigned long last_channel_hop = 0;
+const int HOP_INTERVAL = 2000;
+// No Password/Server Config as per request (ESP-NOW only mode)
 
 // Server firebase 
 String FIREBASE_URL = "https://parking-violation-app-default-rtdb.asia-southeast1.firebasedatabase.app/violations/A2.json";
@@ -945,9 +946,10 @@ uint8_t* cropLicensePlate(const uint8_t* rgb, int srcWidth, int srcHeight,
         return nullptr;
     }
     
-    uint8_t* cropped = (uint8_t*)malloc(*cropWidth * *cropHeight * 3);
+    // Use PSRAM for crop buffer
+    uint8_t* cropped = (uint8_t*)ps_malloc(*cropWidth * *cropHeight * 3);
     if (!cropped) {
-        Serial.println("❌ Failed to allocate memory for cropped image");
+        Serial.println("❌ Failed to allocate memory (PSRAM) for cropped image");
         return nullptr;
     }
     
@@ -971,9 +973,10 @@ uint8_t* cropLicensePlate(const uint8_t* rgb, int srcWidth, int srcHeight,
 
 uint8_t* convertToGrayscale(const uint8_t* rgb, int width, int height) {
     size_t pixels = (size_t)width * height;
-    uint8_t* gray = (uint8_t*)malloc(pixels);
+    // Use PSRAM for grayscale conversion buffer
+    uint8_t* gray = (uint8_t*)ps_malloc(pixels);
     if (!gray) {
-        Serial.println("❌ Failed to allocate memory for grayscale image");
+        Serial.println("❌ Failed to allocate memory (PSRAM) for grayscale image");
         return nullptr;
     }
     
@@ -1652,6 +1655,17 @@ void OnDataRecv(const esp_now_recv_info *recv_info, const uint8_t *incomingDataB
     if (msg.startsWith("DISCOVER_MASTER")) {
       Serial.println(">> Broadcast Received: " + msg);
       
+      // Extract SSID
+      int splitIndex = msg.indexOf(':');
+      if (splitIndex != -1) {
+        String new_ssid = msg.substring(splitIndex + 1);
+        if (new_ssid.length() > 0 && new_ssid != received_ssid) {
+           received_ssid = new_ssid;
+           Serial.println(">> TARGET SSID RECEIVED: " + received_ssid);
+           master_found = true; 
+        }
+      }
+
       bool known = false;
       for (const auto& master : masters) {
         if (memcmp(master.data(), recv_info->src_addr, 6) == 0) {
@@ -1723,7 +1737,7 @@ Serial.begin(115200);
   config.pin_pwdn = PWDN_GPIO_NUM;
   config.pin_reset = RESET_GPIO_NUM;
   config.xclk_freq_hz = 20000000;
-  config.frame_size = FRAMESIZE_UXGA;
+  config.frame_size = FRAMESIZE_VGA; // Optimize: Init directly with VGA
   config.pixel_format = PIXFORMAT_JPEG;
   config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
   config.fb_location = CAMERA_FB_IN_PSRAM;
@@ -1788,20 +1802,19 @@ Serial.begin(115200);
 
 
   // ===========================
-  // KẾT NỐI WiFi
+  // KẾT NỐI WiFi (REMOVED STATIC)
+  // Switch to Station Mode for ESP-NOW and set up Promiscuous Mode for Scanning
   // ===========================
-  WiFi.begin(ssid, password);
-  WiFi.setSleep(false);
+  WiFi.mode(WIFI_STA);
+  // Do not connect yet. ESP-NOW discovery will handlefinding the master.
+  
+  // Default to Channel 1 for scanning
+  esp_wifi_set_promiscuous(true);
+  esp_wifi_set_channel(current_channel, WIFI_SECOND_CHAN_NONE);
+  esp_wifi_set_promiscuous(false);
 
-  Serial.print("WiFi connecting");
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.println("");
-  Serial.println("WiFi connected");
-  Serial.print("IP Address: ");
-  Serial.println(WiFi.localIP());
+  Serial.println("WiFi Mode set to STA. Starting ESP-NOW Discovery...");
+
 
   // Chụp ảnh test ngay sau khi khởi động
   delay(2000);
@@ -1837,9 +1850,23 @@ Serial.begin(115200);
 
 void loop() {
     static unsigned long last = 0;
-    static int current_image = 0;  // Sử dụng current_image thay vì imageCounter
+    static int current_image = 0;
     
-    // --- PIR TRIGGER LOGIC ---
+    // --- 1. CHANNEL HOPPING (Search for Master) ---
+    if (!master_found) {
+      if (millis() - last_channel_hop > HOP_INTERVAL) {
+        last_channel_hop = millis();
+        current_channel++;
+        if (current_channel > 13) current_channel = 1;
+        
+        Serial.printf("Scanning for Master on Channel %d...\n", current_channel);
+        esp_wifi_set_promiscuous(true);
+        esp_wifi_set_channel(current_channel, WIFI_SECOND_CHAN_NONE);
+        esp_wifi_set_promiscuous(false);
+      }
+    }
+
+    // --- 2. PIR TRIGGER LOGIC ---
     int reading = digitalRead(WAKEUP_PIN);
     if (reading == LOW || (millis() - last < 5000)) { // Wait for High AND 5s Debounce
        delay(10); 
@@ -1869,19 +1896,21 @@ void loop() {
     int w = fb->width;
     int h = fb->height;
     size_t jpeg_len = fb->len;
-    uint8_t* jpeg_data = (uint8_t*)malloc(jpeg_len);
+    uint8_t* jpeg_data = (uint8_t*)ps_malloc(jpeg_len); // Use PSRAM
     if (!jpeg_data) {
-        Serial.println("❌ Failed to allocate memory for jpeg data");
+        Serial.println("❌ Failed to allocate memory (PSRAM) for jpeg data");
         esp_camera_fb_return(fb);
         return;
     }
     memcpy(jpeg_data, fb->buf, jpeg_len);  // Sao chép dữ liệu
     
-    // 🔥 Gửi ảnh gốc lên server
+    // HTTP Upload Logic Removed
+    /*
     String tempUrl;
     if (sendImageToServer(fb->buf, fb->len, current_image, tempUrl, "full")) {
         current_image++;
     }
+    */
     
     // Giải phóng frame buffer
     esp_camera_fb_return(fb);
@@ -1889,9 +1918,10 @@ void loop() {
     Serial.printf("🖼️ Processing image, size: %d bytes, dimensions: %dx%d\n", jpeg_len, w, h);
 
     size_t pixels = (size_t)w * h;
-    uint8_t *rgb = (uint8_t*)malloc(pixels * 3);
+    // Use PSRAM for large RGB buffer
+    uint8_t *rgb = (uint8_t*)ps_malloc(pixels * 3);
     if (!rgb) {
-        Serial.println("❌ malloc rgb failed");
+        Serial.println("❌ ps_malloc rgb failed");
         free(jpeg_data);
         return;
     }
@@ -1907,7 +1937,8 @@ void loop() {
     
     bgr2rgb(rgb, pixels);
 
-    uint8_t *gray = (uint8_t*)malloc(pixels);
+    // Use PSRAM for Gray buffer
+    uint8_t *gray = (uint8_t*)ps_malloc(pixels);
     if (!gray) { 
         free(rgb); 
         return; 
@@ -1929,57 +1960,11 @@ void loop() {
     free(rgb);
     free(gray);
     
-    if (croppedRGB) {
-        Serial.println("\n🎯 BẮT ĐẦU XỬ LÝ BIỂN SỐ VÀ PHÂN TÁCH KÝ TỰ");
-        
-        if (plate_gray_image) {
-            free(plate_gray_image);
-            plate_gray_image = nullptr;
-        }
-        
-        plate_gray_image = convertToGrayscale(croppedRGB, cropWidth, cropHeight);
-        
-        if (plate_gray_image) {
-            IMG_WIDTH = cropWidth;
-            IMG_HEIGHT = cropHeight;
-            
-            plateStartX = 0; plateStartY = 0;
-            plateEndX = IMG_WIDTH-1; plateEndY = IMG_HEIGHT-1;
-            
-            processLicensePlate();
-            
-            free(plate_gray_image);
-            plate_gray_image = nullptr;
-        }
-        
-        // Gửi ảnh biển số lên server
-        uint8_t* plate_jpg_buf = NULL;
-        size_t plate_jpg_buf_len = 0;
-        
-        bool plate_ok = fmt2jpg(croppedRGB, cropWidth * cropHeight * 3, 
-                               cropWidth, cropHeight, PIXFORMAT_RGB888, 
-                               90, &plate_jpg_buf, &plate_jpg_buf_len);
-        free(croppedRGB);
-    
-        if (plate_ok) {
-            String imageUrl;
-            bool plateSuccess = sendImageToServer(plate_jpg_buf, plate_jpg_buf_len, 
-                                                 current_image, imageUrl, "plate", recognizedText);
-            
-            // 🔥 SỬ DỤNG URL ẢNH ĐỂ GỬI LÊN FIREBASE
-            if (plateSuccess && imageUrl.length() > 0) {
-                Serial.printf("🚀 Gửi lên Firebase: Biển số=%s, URL ảnh=%s\n", 
-                            recognizedText.c_str(), imageUrl.c_str());
-                updateSlotOwner(recognizedText, imageUrl);
-            } else if (plateSuccess) {
-                Serial.printf("🚀 Gửi lên Firebase: Biển số=%s (không có ảnh)\n", 
-                            recognizedText.c_str());
-                updateSlotOwner(recognizedText, "");
-            }
-            
-            free(plate_jpg_buf);
-        }
-    }
+    // HTTP Upload Removed as per request (SSID only from ESP-NOW, no Server Config)
+    /*
+    if (croppedRGB) { ... } 
+    */
+    if (croppedRGB) free(croppedRGB); // Ensure free if allocated
 
     // --- SEND ESP-NOW DATA ---
     Serial.println("📡 Preparing ESP-NOW Packet...");
