@@ -9,7 +9,7 @@
 #include <Adafruit_NeoPixel.h>
 #ifdef __AVR__
 #include <avr/power.h> // Cần thiết cho Adafruit Trinket 16 MHz
-#endif
+#endif.
 
 #define WAKEUP_PIN GPIO_NUM_13 // Chân cảm biến kích hoạt (chờ tín hiệu HIGH)
 #define BUZZZER_PIN 15         // Chân Piezo Buzzer

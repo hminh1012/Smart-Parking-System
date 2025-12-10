@@ -55,14 +55,14 @@ bool master_found = false;
 
 // ===================== WiFi Config (Dynamic) =====================
 String received_ssid = ""; 
-bool master_found = false;
+// bool master_found = false; // Already defined at line 53
 int current_channel = 1;
 unsigned long last_channel_hop = 0;
 const int HOP_INTERVAL = 2000;
 // No Password/Server Config as per request (ESP-NOW only mode)
 
-// Server firebase 
-String FIREBASE_URL = "https://parking-violation-app-default-rtdb.asia-southeast1.firebasedatabase.app/violations/A2.json";
+// Server firebase URL REMOVED
+
 
 String recognizedText;
 
@@ -1471,41 +1471,12 @@ void detectPlate(uint8_t *gray, int w, int h, int &minX, int &minY, int &maxX, i
 // Gửi biến số lên Firebase 
 
 // 🔥 HÀM GỬI LÊN FIREBASE VỚI CẢ BIỂN SỐ VÀ URL ẢNH
+// function updateSlotOwner removed
+/*
 void updateSlotOwner(String license, String imageUrl ) {
-  if (WiFi.status() == WL_CONNECTED) {
-    HTTPClient http;
-    http.begin(FIREBASE_URL);
-    http.addHeader("Content-Type", "application/json");
-
-    // 🔥 TẠO JSON CHỨA CẢ BIỂN SỐ VÀ URL ẢNH
-    String jsonData;
-    if (imageUrl.length() > 0) {
-      jsonData = "{\"licensePlate\":\"" + license + 
-                "\",\"URL_image\":\"" + imageUrl + 
-                 + "\"}";
-    } else {
-      jsonData = "{\"licensePlate\":\"" + license + 
-                + "\"}";
-    }
-
-    Serial.printf("📤 Gửi dữ liệu lên Firebase: %s\n", jsonData.c_str());
-
-    // Gửi PATCH thay vì PUT
-    int httpResponseCode = http.sendRequest("PATCH", jsonData);
-
-    if (httpResponseCode > 0) {
-      Serial.printf("✅ Gửi Firebase thành công, mã: %d\n", httpResponseCode);
-      String response = http.getString();
-      Serial.printf("📨 Phản hồi: %s\n", response.c_str());
-    } else {
-      Serial.printf("❌ Gửi Firebase thất bại: %s\n", http.errorToString(httpResponseCode).c_str());
-    }
-
-    http.end();
-  } else {
-    Serial.println("❌ Không kết nối WiFi");
-  }
+  // Removed
 }
+*/
 
 // 🔥 HÀM LẤY THỜI GIAN HIỆN TẠI
 String getCurrentTime() {
@@ -1529,6 +1500,8 @@ String getCurrentTime() {
 
 // ===================== Gửi ảnh và kết quả lên server - TRẢ VỀ URL =====================
 bool sendImageToServer(uint8_t* jpg_buf, size_t jpg_len, int imageNumber, String& imageUrl, const char* imageType = "full", const String& recognizedText = "") {
+    // Disabled as per request to remove Server Config
+    /* 
     if (WiFi.status() != WL_CONNECTED) {
         Serial.println("❌ WiFi not connected");
         imageUrl = ""; // Trả về URL rỗng
@@ -1603,6 +1576,8 @@ bool sendImageToServer(uint8_t* jpg_buf, size_t jpg_len, int imageNumber, String
 
     http.end();
     return success;
+    */
+    return false;
 }
 
 // 🔥 HÀM TRÍCH XUẤT GIÁ TRỊ TỪ JSON - KHÔNG CẦN THƯ VIỆN

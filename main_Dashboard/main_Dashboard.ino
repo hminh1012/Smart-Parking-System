@@ -18,7 +18,7 @@
 #include <TFT_eSPI.h>
 #include <XPT2046_Touchscreen.h>
 #include <esp_now.h>
-#include <image.h>
+#include "image.h"
 #include <WiFi.h>
 #include <freertos/queue.h>
 #include <Firebase_ESP_Client.h>
@@ -36,6 +36,7 @@ String wm_ssid;
 String wm_pass;
 String wm_ip;
 String wm_gateway;
+String scanResultHTML = "";
 
 const char* ssidPath = "/ssid.txt";
 const char* passPath = "/pass.txt";
@@ -57,40 +58,52 @@ const char index_html[] PROGMEM = R"rawliteral(
   <link rel="icon" href="data:,">
   <style>
     html { font-family: Arial, Helvetica, sans-serif; display: inline-block; text-align: center; }
-    h1 { font-size: 1.8rem; color: white; }
+    h1 { font-size: 1.8rem; color: black; margin: 10px 0; }
     p { font-size: 1.4rem; }
-    .topnav { overflow: hidden; background-color: #0A1128; }
-    body { margin: 0; }
+    .topnav { overflow: hidden; background-color: white; display: flex; flex-direction: column; align-items: center; padding: 10px; }
+    body { margin: 0; background-color: #f0f0f0; }
     .content { padding: 5%; }
     .card-grid { max-width: 800px; margin: 0 auto; display: grid; grid-gap: 2rem; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); }
-    .card { background-color: white; box-shadow: 2px 2px 12px 1px rgba(140,140,140,.5); }
+    .card { background-color: white; box-shadow: 2px 2px 12px 1px rgba(140,140,140,.5); padding: 20px; }
     .card-title { font-size: 1.2rem; font-weight: bold; color: #034078 }
     input[type=submit] { border: none; color: #FEFCFB; background-color: #034078; padding: 15px 15px; text-align: center; text-decoration: none; display: inline-block; font-size: 16px; width: 100px; margin-right: 10px; border-radius: 4px; transition-duration: 0.4s; }
     input[type=submit]:hover { background-color: #1282A2; }
-    input[type=text], input[type=number], select { width: 50%; padding: 12px 20px; margin: 18px; display: inline-block; border: 1px solid #ccc; border-radius: 4px; box-sizing: border-box; }
-    label { font-size: 1.2rem; }
+    input[type=text], input[type=number], select { width: 100%; padding: 12px 20px; margin: 8px 0; display: inline-block; border: 1px solid #ccc; border-radius: 4px; box-sizing: border-box; }
+    label { font-size: 1.2rem; display: block; text-align: left; margin-top: 10px; }
+    ul { list-style-type: none; padding: 0; margin: 0; text-align: left; }
+    li { padding: 10px; border-bottom: 1px solid #ddd; cursor: pointer; }
+    li:hover { background-color: #f1f1f1; }
   </style>
+  <script>
+    function selectNetwork(ssid) {
+      document.getElementById("ssid").value = ssid;
+    }
+  </script>
 </head>
 <body>
   <div class="topnav">
+    <img src="TAPIT.png" alt="TAPIT Logo" style="height: 60px;">
     <h1>ESP Wi-Fi Manager</h1>
   </div>
   <div class="content">
     <div class="card-grid">
       <div class="card">
+        <h2 class="card-title">Configure WiFi</h2>
         <form action="/" method="POST">
-          <p>
-            <label for="ssid">SSID</label>
-            <input type="text" id ="ssid" name="ssid"><br>
-            <label for="pass">Password</label>
-            <input type="text" id ="pass" name="pass"><br>
-            <label for="ip">IP Address</label>
-            <input type="text" id ="ip" name="ip" placeholder="Optional"><br>
-            <label for="gateway">Gateway Address</label>
-            <input type="text" id ="gateway" name="gateway" placeholder="Optional"><br>
-            <input type ="submit" value ="Submit">
-          </p>
+          <label for="ssid">SSID</label>
+          <input type="text" id ="ssid" name="ssid" placeholder="Enter SSID">
+          <label for="pass">Password</label>
+          <input type="text" id ="pass" name="pass" placeholder="Enter Password">
+          <label for="ip">IP Address</label>
+          <input type="text" id ="ip" name="ip" placeholder="Optional (e.g. 192.168.1.200)">
+          <label for="gateway">Gateway Address</label>
+          <input type="text" id ="gateway" name="gateway" placeholder="Optional (e.g. 192.168.1.1)">
+          <br><br>
+          <input type ="submit" value ="Submit">
         </form>
+      </div>
+      <div class="card">
+        %NETWORK_LIST%
       </div>
     </div>
   </div>
@@ -215,6 +228,11 @@ void writeFile(fs::FS &fs, const char * path, const char * message){
   else Serial.println("- write failed");
 }
 
+String processor(const String& var) {
+  if(var == "NETWORK_LIST") return scanResultHTML;
+  return String();
+}
+
 // --- WiFi Manager Logic ---
 bool initWiFiManager() {
   wm_ssid = readFile(LittleFS, ssidPath);
@@ -273,6 +291,23 @@ void startConfigAP() {
   lv_obj_align_to(label, img, LV_ALIGN_OUT_BOTTOM_MID, 0, 10);
 
   Serial.println("Setting AP (Access Point)");
+  
+  // Scan for networks
+  WiFi.mode(WIFI_AP_STA);
+  int n = WiFi.scanNetworks();
+  scanResultHTML = "<h2 class='card-title'>Available Networks</h2><ul>";
+  if (n == 0) {
+    scanResultHTML += "<li>No networks found</li>";
+  } else {
+    for (int i = 0; i < n; ++i) {
+      String ssid = WiFi.SSID(i);
+      String rssi = String(WiFi.RSSI(i));
+      String encryption = (WiFi.encryptionType(i) == WIFI_AUTH_OPEN) ? " " : "*";
+      scanResultHTML += "<li onclick=\"selectNetwork('" + ssid + "')\">" + ssid + " (" + rssi + " dBm)" + encryption + "</li>";
+    }
+  }
+  scanResultHTML += "</ul>";
+
   WiFi.softAP("SMART-PARKING-CONFIG", NULL);
   
   IPAddress IP = WiFi.softAPIP();
@@ -280,8 +315,10 @@ void startConfigAP() {
   Serial.println(IP); 
 
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
-      request->send(200, "text/html", index_html);
+      request->send_P(200, "text/html", index_html, processor);
   });
+
+  server.serveStatic("/", LittleFS, "/");
   
   server.on("/", HTTP_POST, [](AsyncWebServerRequest *request) {
       int params = request->params();
@@ -395,9 +432,7 @@ static void led_button_event_handler(lv_event_t * e) {
 
 static void event_wifi_config(lv_event_t * e) {
     startConfigAP();
-    lv_obj_t * btn = (lv_obj_t *)lv_event_get_target(e);
-    lv_obj_t * label = lv_obj_get_child(btn, 0);
-    lv_label_set_text(label, "Config Mode Active!");
+    // Button is destroyed by startConfigAP (clears screen), so we cannot update its label.
 }
 
 void update_table_values(int board_id, struct_message *myData) {
@@ -480,7 +515,7 @@ void lv_create_main_gui(void) {
 
   lv_obj_t * tab_sys = lv_tabview_add_tab(tabview, "Sys");
   lv_obj_t * btn_conf = lv_button_create(tab_sys);
-  lv_obj_set_size(btn_conf, 180, 50);
+  lv_obj_set_size(btn_conf, 220, 80);
   lv_obj_center(btn_conf);
   lv_obj_add_event_cb(btn_conf, event_wifi_config, LV_EVENT_CLICKED, NULL);
   lv_obj_t * label_conf = lv_label_create(btn_conf);
