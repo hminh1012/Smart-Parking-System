@@ -24,6 +24,8 @@
 #include <Firebase_ESP_Client.h>
 #include "addons/TokenHelper.h"
 #include "addons/RTDBHelper.h"
+#include <SD.h>
+#include <SPI.h>
 
 // --- WiFi Manager Globals ---
 AsyncWebServer server(80);
@@ -48,6 +50,14 @@ IPAddress localGateway;
 IPAddress subnet(255, 255, 0, 0);
 
 bool inConfigMode = false;
+bool offlineMode = false;           // True when SSID exists but WiFi connection failed
+
+// --- SD Card SPI Pins ---
+#define SD_MISO  19
+#define SD_MOSI  23
+#define SD_SCK   18
+#define SD_CS    5
+SPIClass sdSPI(HSPI);               // Separate SPI bus for SD card
 
 const char index_html[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
@@ -231,6 +241,44 @@ void writeFile(fs::FS &fs, const char * path, const char * message){
 String processor(const String& var) {
   if(var == "NETWORK_LIST") return scanResultHTML;
   return String();
+}
+
+// --- SD Card Functions ---
+bool initSDCard() {
+  sdSPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
+  if (!SD.begin(SD_CS, sdSPI)) {
+    Serial.println("SD Card initialization failed!");
+    return false;
+  }
+  Serial.println("SD Card initialized successfully.");
+  
+  // Create header if file doesn't exist
+  if (!SD.exists("/espnow_log.csv")) {
+    File dataFile = SD.open("/espnow_log.csv", FILE_WRITE);
+    if (dataFile) {
+      dataFile.println("timestamp_ms,board_id,status,license,readingId,sender_mac");
+      dataFile.close();
+    }
+  }
+  return true;
+}
+
+void logToSDCard(GatewayMessage* msg, int board_id) {
+  File dataFile = SD.open("/espnow_log.csv", FILE_APPEND);
+  if (dataFile) {
+    // Format: timestamp,board_id,status,license,readingId,sender_mac
+    String line = String(millis()) + "," +
+                  String(board_id) + "," +
+                  String(msg->payload.status) + "," +
+                  String(msg->payload.CarLicense) + "," +
+                  String(msg->payload.readingId) + "," +
+                  formatMacAddress(msg->senderMac);
+    dataFile.println(line);
+    dataFile.close();
+    Serial.println("Logged to SD: " + line);
+  } else {
+    Serial.println("Error opening SD log file!");
+  }
 }
 
 // --- WiFi Manager Logic ---
@@ -546,14 +594,27 @@ void setup() {
 
 
   if (!initWiFiManager()) {
-    Serial.println("Starting Config AP...");
-    startConfigAP();
-    return; // Exit setup to avoid Firebase/GUI init crashes
+    if (wm_ssid != "") {
+      // SSID exists but WiFi connection failed -> Offline Mode
+      Serial.println("WiFi unavailable. Entering OFFLINE mode...");
+      offlineMode = true;
+      if (!initSDCard()) {
+        Serial.println("WARNING: SD Card failed! ESP-NOW data will be lost.");
+      }
+      // Continue to init ESP-NOW and GUI (skip Firebase)
+    } else {
+      // No SSID saved -> Config AP Mode
+      Serial.println("Starting Config AP...");
+      startConfigAP();
+      return; // Exit setup to avoid Firebase/GUI init crashes
+    }
   }
 
-  config.api_key = WEB_API_KEY; auth.user.email = USER_EMAIL; auth.user.password = USER_PASS;
-  config.database_url = DATABASE_URL; config.token_status_callback = tokenStatusCallback;
-  Firebase.begin(&config, &auth); Firebase.reconnectWiFi(true);
+  // --- Firebase Init (Only when online) ---
+  if (!offlineMode) {
+    config.api_key = WEB_API_KEY; auth.user.email = USER_EMAIL; auth.user.password = USER_PASS;
+    config.database_url = DATABASE_URL; config.token_status_callback = tokenStatusCallback;
+    Firebase.begin(&config, &auth); Firebase.reconnectWiFi(true);
 
   Serial.println("Fetching Config from Firebase...");
   unsigned long startWait = millis();
@@ -573,7 +634,9 @@ void setup() {
       }
     }
   }
+  } // End of if (!offlineMode)
 
+  // --- ESP-NOW Init (Works in both online and offline mode) ---
   if (esp_now_init() != ESP_OK) return;
   esp_now_register_recv_cb(OnDataRecv);
   esp_now_peer_info_t peerInfo = {};
@@ -599,7 +662,7 @@ void setup() {
   
   lv_create_main_gui(); 
 
-  if (Firebase.ready()) {
+  if (!offlineMode && Firebase.ready()) {
     for (int i = 0; i < current_boards; i++) readDataFromFirebase(i + 1);
   }
 }
@@ -631,36 +694,45 @@ void handle_esp_now_incoming() {
       if (!boards_online_state[board_index]) {
         boards_online_state[board_index] = true;
         if (conn_table) lv_table_set_cell_value(conn_table, board_index + 1, 2, "Online");
-        if (Firebase.ready()) {
+        if (!offlineMode && Firebase.ready()) {
            Firebase.RTDB.setString(&fbdo, getSpotPath(calculated_id) + "/connection_status", "online");
         }
       }
 
-      // --- Parking Logic ---
-      ParkingSpot* spot = &spots[board_index];
-      FirebaseJson json;
-      String spotPath = getSpotPath(calculated_id);
+      // --- OFFLINE MODE: Log to SD Card ---
+      if (offlineMode) {
+        logToSDCard(&msg, calculated_id);
+        // Still update the local display
+        ParkingSpot* spot = &spots[board_index];
+        spot->last_status = receivedData.status;
+        update_table_values(calculated_id, &receivedData);
+      } else {
+        // --- ONLINE MODE: Sync to Firebase ---
+        ParkingSpot* spot = &spots[board_index];
+        FirebaseJson json;
+        String spotPath = getSpotPath(calculated_id);
 
-      if (receivedData.status == 1 && spot->last_status != 1) {
-        spot->start_time = millis();
-        if (Firebase.ready()) {
-          json.set("status", FB_STATUS_OCCUPIED);
-          json.set("currentVehicle/licensePlate", String(receivedData.CarLicense));
-          json.set("duration", "null"); json.set("revenue", "null");
-          Firebase.RTDB.updateNode(&fbdo, spotPath, &json);
+        if (receivedData.status == 1 && spot->last_status != 1) {
+          spot->start_time = millis();
+          if (Firebase.ready()) {
+            json.set("status", FB_STATUS_OCCUPIED);
+            json.set("currentVehicle/licensePlate", String(receivedData.CarLicense));
+            json.set("duration", "null"); json.set("revenue", "null");
+            Firebase.RTDB.updateNode(&fbdo, spotPath, &json);
+          }
+        } else if (receivedData.status == 0 && spot->last_status == 1) {
+          float duration_h = (millis() - spot->start_time) / 3600000.0f;
+          if (Firebase.ready()) {
+            json.set("status", FB_STATUS_AVAILABLE);
+            json.set("currentVehicle", "null");
+            json.set("duration", duration_h);
+            json.set("revenue", duration_h * HOURLY_RATE);
+            Firebase.RTDB.updateNode(&fbdo, spotPath, &json);
+          }
         }
-      } else if (receivedData.status == 0 && spot->last_status == 1) {
-        float duration_h = (millis() - spot->start_time) / 3600000.0f;
-        if (Firebase.ready()) {
-          json.set("status", FB_STATUS_AVAILABLE);
-          json.set("currentVehicle", "null");
-          json.set("duration", duration_h);
-          json.set("revenue", duration_h * HOURLY_RATE);
-          Firebase.RTDB.updateNode(&fbdo, spotPath, &json);
-        }
+        spot->last_status = receivedData.status;
+        update_table_values(calculated_id, &receivedData);
       }
-      spot->last_status = receivedData.status;
-      update_table_values(calculated_id, &receivedData);
 
     } else {
       // Optional: Print ignored MACs for debugging
@@ -677,7 +749,7 @@ void handle_timeout_check() {
       if (boards_online_state[i] && (millis() - boards_last_seen[i] > CONNECTION_TIMEOUT_MS)) {
         boards_online_state[i] = false; 
         if (conn_table) lv_table_set_cell_value(conn_table, i + 1, 2, "Offline");
-        if (Firebase.ready()) {
+        if (!offlineMode && Firebase.ready()) {
            Firebase.RTDB.setString(&fbdo, getSpotPath(i + 1) + "/connection_status", "offline");
         }
       }
@@ -720,7 +792,9 @@ void loop() {
   // 2. Handle Network Tasks
   handle_esp_now_incoming();
   handle_timeout_check();
-  handle_firebase_sync();
+  if (!offlineMode) {
+    handle_firebase_sync();  // Only sync Firebase when online
+  }
   handle_beacon_broadcast();
 
   // 3. Yield to system (Watchdog)

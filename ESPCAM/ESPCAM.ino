@@ -24,8 +24,14 @@ std::vector<std::vector<uint8_t>> masters;
 bool motionDetected = false;
 bool firstMessageSent = false;
 bool isOccupied = false; // Track current parking status
+bool receivedLedOn = false; // Track received LED command state
 int pirState = LOW;
 unsigned int readingId = 0;
+
+// --- PIR DEBOUNCE (Reduce Sensitivity) ---
+unsigned long pirHighStart = 0;        // When PIR first went HIGH
+bool pirPendingConfirmation = false;   // Waiting for confirmation
+const unsigned long PIR_CONFIRM_MS = 500; // Must stay HIGH for 500ms to confirm
 
 // --- MESSAGE STRUCTURES ---
 typedef struct {
@@ -50,6 +56,23 @@ void setStripColor(uint32_t color) {
     WS2812B.setPixelColor(pixel, color);
   }
   WS2812B.show();
+}
+
+void updateLedColor() {
+  // LED Logic:
+  // RED if occupied
+  // BLUE if available AND received LED state is ON
+  // GREEN if available (default)
+  if (isOccupied) {
+    Serial.println("LED -> RED (Occupied)");
+    setStripColor(WS2812B.Color(255, 0, 0)); // RED
+  } else if (receivedLedOn) {
+    Serial.println("LED -> BLUE (Available + LED ON)");
+    setStripColor(WS2812B.Color(0, 0, 255)); // BLUE
+  } else {
+    Serial.println("LED -> GREEN (Available)");
+    setStripColor(WS2812B.Color(0, 255, 0)); // GREEN
+  }
 }
 
 // --- MELODY FOR BUZZER ---
@@ -167,7 +190,15 @@ void OnDataRecv(const esp_now_recv_info *recv_info, const uint8_t *incomingDataB
     if (msg.startsWith("DISCOVER_MASTER:")) {
       if (received_ssid == "") {
         received_ssid = msg.substring(16);
+        
+        // Lock WiFi channel to the gateway's channel
+        int gatewayChannel = WiFi.channel();
+        esp_wifi_set_promiscuous(true);
+        esp_wifi_set_channel(gatewayChannel, WIFI_SECOND_CHAN_NONE);
+        esp_wifi_set_promiscuous(false);
+        
         Serial.println(">> CONNECTED TO GATEWAY: " + received_ssid);
+        Serial.printf(">> WiFi Channel locked to: %d\n", gatewayChannel);
       }
     }
     return;
@@ -181,17 +212,12 @@ void OnDataRecv(const esp_now_recv_info *recv_info, const uint8_t *incomingDataB
     Serial.print("From Board ID: ");
     Serial.println(incomingData.id);
     Serial.print("LED State: ");
-    Serial.println(incomingData.state ? "ON (RED)" : "OFF (GREEN)");
+    Serial.println(incomingData.state ? "ON" : "OFF");
     Serial.println("----------------------------");
     
-    // --- WS2812B LED CONTROL (Same as ESP_module_dummy) ---
-    if (incomingData.state == true) {
-      Serial.println("Setting LED to RED");
-      setStripColor(WS2812B.Color(255, 0, 0)); // RED = Occupied/Alert
-    } else {
-      Serial.println("Setting LED to GREEN");
-      setStripColor(WS2812B.Color(0, 255, 0)); // GREEN = Available
-    }
+    // Update received LED state and refresh LED color
+    receivedLedOn = incomingData.state;
+    updateLedColor();
   }
 }
 
@@ -258,31 +284,42 @@ void loop() {
     firstMessageSent = true;
   }
 
-  // --- 2. MOTION DETECTION LOGIC (Toggle on each motion) ---
+  // --- 2. MOTION DETECTION LOGIC (Toggle on each motion, with debounce) ---
   pirState = digitalRead(PIN_PIR);
 
-  if (pirState == HIGH && !motionDetected) {
-    // ----> MOTION DETECTED! <----
-    Serial.println(">>> MOTION DETECTED <<<");
-    motionDetected = true;
+  if (pirState == HIGH) {
+    if (!pirPendingConfirmation) {
+      // First time HIGH detected, start the confirmation timer
+      pirHighStart = millis();
+      pirPendingConfirmation = true;
+    } else if (!motionDetected && (millis() - pirHighStart >= PIR_CONFIRM_MS)) {
+      // PIR has been HIGH for the confirmation period -> CONFIRMED MOTION
+      Serial.println(">>> MOTION DETECTED (Confirmed) <<<");
+      motionDetected = true;
 
-    // Toggle parking status on each detection
-    if (!isOccupied) {
-      // Was available -> Now occupied (with random license)
-      sendOccupiedMessage();
-      isOccupied = true;
-    } else {
-      // Was occupied -> Now available (with null license)
-      sendAvailableMessage();
-      isOccupied = false;
+      // Toggle parking status on each detection
+      if (!isOccupied) {
+        // Was available -> Now occupied (with random license)
+        sendOccupiedMessage();
+        isOccupied = true;
+      } else {
+        // Was occupied -> Now available (with null license)
+        sendAvailableMessage();
+        isOccupied = false;
+      }
+
+      // Update LED color based on new status
+      updateLedColor();
+
+      // Trigger Buzzer Melody
+      triggerBuzzer();
     }
-
-    // Trigger Buzzer Melody
-    triggerBuzzer();
-
-  } else if (pirState == LOW && motionDetected) {
-    // Reset motion flag when PIR goes LOW (ready for next detection)
+  } else {
+    // PIR went LOW -> Reset everything
+    if (motionDetected) {
+      Serial.println("Motion sensor reset, ready for next detection.");
+    }
+    pirPendingConfirmation = false;
     motionDetected = false;
-    Serial.println("Motion sensor reset, ready for next detection.");
   }
 }
